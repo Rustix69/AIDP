@@ -1,0 +1,12 @@
+-- The register row a proposal would become.
+--
+-- Registers (parsing/registers.py) file each rule as a row: a reference, a
+-- category, an owner, a status, a title, a statement, a rationale. A draft held
+-- only requirement lines, so publishing one as a rule of its own asked the
+-- approver to hand-type a title and a statement and gave the new clause no
+-- reference, category or owner at all. This column carries the drafted row.
+--
+-- Defaulted rather than nullable so every existing draft reads as "{}" without
+-- a backfill, and the application can treat "no entry" as one shape instead of
+-- two.
+ALTER TABLE "clause_draft" ADD COLUMN "entry" JSONB NOT NULL DEFAULT '{}';

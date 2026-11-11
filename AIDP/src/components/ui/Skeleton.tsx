@@ -12,6 +12,8 @@ import { cn } from "@/lib/cn";
  * classes, so variations are props here rather than overriding classNames.
  */
 
+const CELL = ["w-36", "w-28", "w-44", "w-32", "w-40"];
+
 /** One placeholder bar, or a block with `square`. Size comes from `className`. */
 export function Bone({ className, square = false }: { className?: string; square?: boolean }) {
   return (
@@ -59,6 +61,25 @@ export function PageHeaderSkeleton({
   );
 }
 
+/**
+ * HeroCard's block: the greeting, the one line under it, and the action.
+ *
+ * Its own bones rather than `Bone`: the hero is the page's only deep surface,
+ * and ink at 8% is invisible on it. White at the same weight reads there the
+ * way `Bone` reads on a card.
+ */
+export function HeroSkeleton() {
+  return (
+    <div className="mb-6 flex flex-wrap items-center justify-between gap-x-6 gap-y-4 rounded-2xl bg-deep px-7 py-6 shadow-card">
+      <div className="min-w-0">
+        <div className="h-7 w-56 max-w-full rounded-full bg-white/15" />
+        <div className="mt-4 h-4 w-[26rem] max-w-full rounded-full bg-white/10" />
+      </div>
+      <div className="h-11 w-44 shrink-0 rounded-full border border-white/25 bg-white/10" />
+    </div>
+  );
+}
+
 /** A figure tile: icon and label, the number, and a hint beneath. */
 export function StatSkeleton() {
   return (
@@ -67,13 +88,48 @@ export function StatSkeleton() {
         <Bone square className="size-4" />
         <Bone className="h-3 w-24" />
       </div>
-      <Bone square className="mt-3.5 h-7 w-16" />
-      <Bone className="mt-2 h-3 w-32" />
+      <Bone square className="mt-4 h-8 w-14" />
+      <Bone className="mt-2.5 h-3 w-32" />
     </div>
   );
 }
 
-const CELL = ["w-36", "w-28", "w-44", "w-32", "w-40"];
+/**
+ * A `Panel` with a divided list in it — head, rule, then one `PanelRow` each.
+ *
+ * `when` draws the second, quieter line under the pill, which is what makes a
+ * recent-activity row taller than a plain one; panels without it pass it over.
+ */
+export function PanelListSkeleton({
+  rows = 4,
+  when = false,
+}: {
+  rows?: number;
+  when?: boolean;
+}) {
+  return (
+    <section className="overflow-hidden rounded-2xl border border-line bg-card shadow-card">
+      <div className="border-b border-line px-5 pt-4 pb-3.5">
+        <Bone className="h-4 w-40" />
+        <Bone className="mt-2.5 h-3 w-64" />
+      </div>
+      <div className="divide-y divide-line">
+        {Array.from({ length: rows }, (_, index) => (
+          <div key={index} className="flex items-center justify-between gap-3.5 px-5 py-3">
+            <div className="min-w-0">
+              <Bone className={cn("h-3.5", CELL[index % CELL.length])} />
+              <Bone className="mt-1.5 h-3 w-40" />
+            </div>
+            <div className="shrink-0">
+              <div className="ml-auto h-[26px] w-24 rounded-full border border-line" />
+              {when ? <Bone className="ml-auto mt-1 h-3 w-14" /> : null}
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
 
 /** A bordered table: a header band, then rows led by a name-and-detail cell. */
 export function TableSkeleton({

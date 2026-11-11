@@ -3,17 +3,22 @@ import { ClipboardList } from "lucide-react";
 import { requireWorkspace } from "@/lib/access/gate";
 import { advanceSubmitted, listRequests } from "@/lib/ingest/requests";
 import { PageHeader } from "@/components/ui/PageHeader";
+import { Panel } from "@/components/ui/Panel";
+import { Pill, type PillTone } from "@/components/ui/Pill";
+import { Cell, DataTable, Row } from "@/components/ui/DataTable";
 import { NewRequest } from "./new/NewRequest";
 
 export const dynamic = "force-dynamic";
 
-const TONE: Record<string, string> = {
-  draft: "border-line text-ink/60",
-  submitted: "border-royal-mid/40 bg-royal/8 text-royal",
-  checking: "border-royal-mid/40 bg-royal/8 text-royal",
-  reported: "border-ok-line bg-ok-tint text-ok",
-  decided: "border-ok-line bg-ok-tint text-ok",
-  failed: "border-warn-line bg-warn-tint text-warn",
+/** Where each state sits on the one scale the whole product uses: nothing
+ *  happening, something in flight, something settled, something stopped. */
+const TONE: Record<string, PillTone> = {
+  draft: "neutral",
+  submitted: "info",
+  checking: "info",
+  reported: "ok",
+  decided: "ok",
+  failed: "warn",
 };
 
 const LABEL: Record<string, string> = {
@@ -78,7 +83,7 @@ export default async function RequestsPage() {
       />
 
       {requests.length === 0 ? (
-        <div className="rounded-xl border border-dashed border-line px-6 py-12 text-center">
+        <div className="rounded-2xl border border-dashed border-line bg-card px-6 py-12 text-center">
           <ClipboardList size={22} className="mx-auto mb-3 text-ink/30" aria-hidden="true" />
           <p className="text-[14px] text-ink/70">No requests yet.</p>
           <p className="mt-1 text-[12.5px] text-ink/50">
@@ -86,38 +91,38 @@ export default async function RequestsPage() {
           </p>
         </div>
       ) : (
-        <ul className="grid gap-2">
-          {requests.map((request) => (
-            <li key={request.id}>
-              <Link
-                href={`/dashboard/requests/${request.id}`}
-                className="flex items-center gap-3 rounded-xl border border-line bg-card px-4 py-3 transition-colors hover:border-royal-mid/40"
-              >
-                <span className="shrink-0 font-mono text-[12px] tabular-nums text-ink/50">
+        /* A table rather than a stack of cards, which is how the client's
+           prototype lists anything with columns: the reference, who raised it
+           and where it got to line up down the page, so a run of twenty can be
+           scanned without reading each one. */
+        <Panel flush>
+          <DataTable head={["Reference", "Request", "Raised by", "Status"]} minWidth={640}>
+            {requests.map((request) => (
+              <Row key={request.id} className="transition-colors hover:bg-canvas-sunk/60">
+                <Cell className="whitespace-nowrap font-mono text-[12px] tabular-nums text-ink/55">
                   {request.reference}
-                </span>
-                <span className="min-w-0 flex-1">
-                  <span className="block truncate text-[13.5px] font-medium text-ink">
+                </Cell>
+                <Cell className="max-w-[22rem]">
+                  <Link
+                    href={`/dashboard/requests/${request.id}`}
+                    className="block truncate font-medium text-ink hover:text-royal"
+                  >
                     {request.title || "Untitled request"}
-                  </span>
-                  {/* No project here. Every request opens one for itself and
-                      it is never shown — naming it would invite somebody to go
-                      looking for a thing they cannot manage. */}
-                  <span className="block truncate text-[12px] text-ink/55">
-                    {request.requestedByName}
-                  </span>
-                </span>
-                <span
-                  className={`shrink-0 rounded-full border px-2.5 py-0.5 text-[11.5px] ${
-                    TONE[request.state] ?? "border-line text-ink/60"
-                  }`}
-                >
-                  {LABEL[request.state] ?? request.state}
-                </span>
-              </Link>
-            </li>
-          ))}
-        </ul>
+                  </Link>
+                </Cell>
+                {/* No project here. Every request opens one for itself and it
+                    is never shown — naming it would invite somebody to go
+                    looking for a thing they cannot manage. */}
+                <Cell className="whitespace-nowrap text-ink/62">{request.requestedByName}</Cell>
+                <Cell>
+                  <Pill tone={TONE[request.state] ?? "neutral"}>
+                    {LABEL[request.state] ?? request.state}
+                  </Pill>
+                </Cell>
+              </Row>
+            ))}
+          </DataTable>
+        </Panel>
       )}
     </>
   );

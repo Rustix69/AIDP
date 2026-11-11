@@ -145,6 +145,23 @@ export function readObligation(value: unknown): Obligation {
 }
 
 /**
+ * A verdict this engine knows, or `needs_review` for one it does not.
+ *
+ * For the places that need a `Verdict` to index a label or seed a form. It is
+ * deliberately *not* what `effectiveFinding` does to a verdict it does not
+ * recognise: coercing there would rename the finding rather than describe it,
+ * and a stored verdict from a future engine would start reporting as a real
+ * `needs_review` and be counted as one. Severity needs no coercion at all —
+ * `severityOf` already answers "a person has to look" for anything it has not
+ * been taught.
+ */
+export function readVerdict(value: unknown): Verdict {
+  return (VERDICTS as readonly string[]).includes(value as string)
+    ? (value as Verdict)
+    : "needs_review";
+}
+
+/**
  * How much a finding should worry the person reading it.
  *
  * Distinct from the verdict, and the distinction is the point. The verdict says
@@ -270,7 +287,27 @@ export function briefSeverityOf(
   verdict: string,
   obligation: Obligation = "unstated",
 ): { tier: BriefSeverity; settled: boolean } | null {
-  const severity = severityOf(verdict, obligation);
+  return briefFromSeverity(severityOf(verdict, obligation), verdict);
+}
+
+/**
+ * The three-tier severity on the brief's four, given the verdict it belongs to.
+ *
+ * Split out of `briefSeverityOf` so that a severity a *reviewer* set maps to
+ * the four tiers exactly as a derived one does. Two routes to the same scale
+ * would eventually disagree, and a finding labelled High on the report and
+ * Medium in the export is worse than either label alone — the same reasoning
+ * that made `briefSeverityOf` derive from `severityOf` rather than read the
+ * verdict a second time.
+ *
+ * `verdict` is still a parameter because the `moderate` tier splits on it, and
+ * that split is about what the design did rather than how serious it is. It is
+ * read here and never written: grading a finding cannot change what it is.
+ */
+export function briefFromSeverity(
+  severity: Severity | null,
+  verdict: string,
+): { tier: BriefSeverity; settled: boolean } | null {
   // Nothing to act on, so nothing to grade — same answer, same reason.
   if (!severity) return null;
 
@@ -290,6 +327,239 @@ export function briefSeverityOf(
   const shortfall = verdict === "partial" || verdict === "contradicts";
   return { tier: shortfall ? "high" : "medium", settled: true };
 }
+
+/**
+ * The engine's answer and the reviewer's, resolved into the one a reader sees.
+ *
+ * This is the only place that resolution happens, and it exists because for a
+ * long time it happened nowhere. A reviewer could correct a verdict, the
+ * correction was stored on `reviewerVerdict`, and the application read that
+ * column in exactly one place — the decision promoter. Every severity, every
+ * verdict count, the risk matrix, the report scorecard, the .docx export and
+ * `nextStep`, which decides whether a submission goes to the board, all read
+ * the engine's raw `verdict` and `obligation`. Overriding `contradicts` to
+ * `covered` left the report calling it a critical breach and still routing the
+ * submission to the board.
+ *
+ * So the rule is: nothing computes a severity from a bare verdict any more.
+ * Callers pass the finding and take `severity` and `brief` from the result.
+ *
+ * ## Why the engine's answer is still in the row
+ *
+ * It is never overwritten, here or in the database. The disagreement between
+ * what the model said and what a person decided is the only evaluation data
+ * this product will ever have — it is what tells us how well the engine is
+ * actually doing — and resolving the pair at read time keeps both. Every field
+ * the result carries has its original beside it, and `corrected` says which
+ * ones a person moved, so a screen can show the change rather than quietly
+ * presenting a human judgement as the machine's.
+ *
+ * ## What counts as corrected
+ *
+ * A reviewer value that is absent, blank, or identical to the engine's is not a
+ * correction. Confirming a verdict writes `reviewerVerdict = null` — agreement
+ * is not a correction either, and the badge that says "corrected" has to mean
+ * something or reviewers stop reading it.
+ *
+ * Pure, like everything else in this file: rows in, a view out, no database and
+ * nothing server-only, so a client component can call it on the row it was
+ * handed.
+ */
+export type ReviewableFinding = {
+  /** The engine's verdict. */
+  verdict: string;
+  /** The engine's obligation. Typed loosely because the callers range from a
+   *  Prisma row to a structural test fixture; `readObligation` refuses anything
+   *  that is not one of the four. */
+  obligation?: unknown;
+  /** The engine's rationale. */
+  rationale?: string | null;
+  reviewerVerdict?: string | null;
+  reviewerObligation?: string | null;
+  /** A severity a reviewer put on this directly, overriding the derived one. */
+  reviewerSeverity?: string | null;
+  reviewerRationale?: string | null;
+};
+
+export type Corrections = {
+  verdict: boolean;
+  obligation: boolean;
+  severity: boolean;
+  rationale: boolean;
+};
+
+export type EffectiveFinding = {
+  /**
+   * What this finding says now, after any correction.
+   *
+   * Typed as a string rather than a `Verdict`, because a row may hold one this
+   * build has never heard of — written by a newer engine, or by an older one
+   * whose vocabulary has since changed. Narrowing it here would mean quietly
+   * renaming that finding to `needs_review` everywhere it is read, which is how
+   * a verdict nobody recognises ends up counted as one everybody does. Callers
+   * that need a `Verdict` say so with `readVerdict`; callers that need a label
+   * fall back to one.
+   */
+  verdict: string;
+  obligation: Obligation;
+  rationale: string;
+  /**
+   * Severity on the engine's three-tier scale: what a reviewer put there, or
+   * what the verdict and obligation come to.
+   *
+   * Null where the verdict carries nothing to act on — `covered` and
+   * `not_applicable` — whatever a reviewer may have stored. "Covered ·
+   * Critical" is a row that reads as a problem when it is the opposite.
+   */
+  severity: Severity | null;
+  /** The same finding on the brief's four tiers. */
+  brief: { tier: BriefSeverity; settled: boolean } | null;
+  /** Which of the three a person moved. */
+  corrected: Corrections;
+  /** True where any of them was. */
+  edited: boolean;
+  /** What the engine itself said, kept so a screen can show the change. */
+  engine: {
+    verdict: string;
+    obligation: Obligation;
+    rationale: string;
+    /** The severity the verdict and obligation come to on their own. */
+    severity: Severity | null;
+  };
+};
+
+/** A reviewer value that is present, valid, and actually different. */
+function correction<T extends string>(
+  reviewer: string | null | undefined,
+  engine: T,
+  // Takes the trimmed string, never `unknown`: the value has already been
+  // checked against the field's vocabulary by `allowed` on the line below.
+  read: (value: string) => T,
+  allowed: (value: string) => boolean,
+): T | null {
+  if (typeof reviewer !== "string") return null;
+  const trimmed = reviewer.trim();
+  if (!trimmed || !allowed(trimmed)) return null;
+  const value = read(trimmed);
+  return value === engine ? null : value;
+}
+
+export function effectiveFinding(finding: ReviewableFinding): EffectiveFinding {
+  // Taken as it is. See the note on `verdict` above: a verdict this build does
+  // not recognise is reported as itself, and `severityOf` grades it as "check".
+  const engineVerdict = finding.verdict;
+  const engineObligation = readObligation(finding.obligation);
+  const engineRationale = finding.rationale ?? "";
+
+  const verdict =
+    correction<string>(
+      finding.reviewerVerdict,
+      engineVerdict,
+      (value) => value,
+      // A *correction* is held to the known vocabulary even though the engine's
+      // own answer is not: nobody should be able to type a verdict into the
+      // record that no screen can label and no severity rule has been taught.
+      (value) => (VERDICTS as readonly string[]).includes(value),
+    ) ?? engineVerdict;
+
+  const obligation =
+    correction<Obligation>(
+      finding.reviewerObligation,
+      engineObligation,
+      readObligation,
+      (value) => (OBLIGATIONS as readonly string[]).includes(value),
+    ) ?? engineObligation;
+
+  // Prose, so it cannot be validated against a vocabulary — only against being
+  // blank, and against being what the engine already said.
+  const written = finding.reviewerRationale?.trim() ?? "";
+  const rationale = written && written !== engineRationale.trim() ? written : engineRationale;
+
+  /**
+   * Severity: what a reviewer put there, else what the two above come to.
+   *
+   * Read from its own field rather than inferred, and it is deliberately the
+   * *last* thing resolved — it depends on the corrected verdict and obligation
+   * and nothing depends on it. That ordering is what guarantees the property
+   * the column exists to have: grading a finding cannot reclassify it. A
+   * `contradicts` graded Moderate is still a contradiction, counted as one,
+   * exported as one, and still a breach in the register. The severity control
+   * is a priority, never a reclassification.
+   *
+   * The override is ignored outright where the verdict carries no severity, so
+   * a grading left behind on a finding later corrected to `covered` cannot
+   * resurface as "Covered · Critical".
+   */
+  const derived = severityOf(verdict, obligation);
+  const severity =
+    derived === null
+      ? // Nothing to act on, so nothing to grade — and nothing a stored grading
+        // can do about it.
+        null
+      : // Compared against the derived grade, so choosing the one it already has
+        // stores no override: the same rule the other three fields follow.
+        (correction<Severity>(
+          finding.reviewerSeverity,
+          derived,
+          (value) => value as Severity,
+          (value) => (SEVERITIES as readonly string[]).includes(value),
+        ) ?? derived);
+
+  const corrected: Corrections = {
+    verdict: verdict !== engineVerdict,
+    obligation: obligation !== engineObligation,
+    severity: severity !== null && severity !== derived,
+    rationale: rationale !== engineRationale,
+  };
+
+  return {
+    verdict,
+    obligation,
+    rationale,
+    severity,
+    brief: briefFromSeverity(severity, verdict),
+    corrected,
+    edited:
+      corrected.verdict || corrected.obligation || corrected.severity || corrected.rationale,
+    engine: {
+      verdict: engineVerdict,
+      obligation: engineObligation,
+      rationale: engineRationale,
+      severity: severityOf(engineVerdict, engineObligation),
+    },
+  };
+}
+
+/**
+ * The fields a reviewer may change, and what each one is called on screen.
+ *
+ * One list, so the edit form, the server action that validates a save and the
+ * history panel that labels a past change cannot drift apart — the same
+ * reasoning as `ROLES` in src/lib/access/roles.ts. Adding a field here is what
+ * makes it editable; nothing else has a list of its own.
+ *
+ * `state` is in the vocabulary but not in the form: it is what the confirm and
+ * override buttons move, and the history records it alongside the rest so a
+ * reader sees one sequence of events rather than two.
+ */
+export const EDITABLE_FIELDS = [
+  "verdict",
+  "obligation",
+  "severity",
+  "rationale",
+  "note",
+] as const;
+
+export type EditableField = (typeof EDITABLE_FIELDS)[number];
+
+export const EDIT_FIELD_LABEL: Record<EditableField | "state", string> = {
+  verdict: "Verdict",
+  obligation: "Obligation",
+  severity: "Severity",
+  rationale: "Rationale",
+  note: "Note",
+  state: "Review",
+};
 
 export type VerdictCounts = Record<Verdict, number>;
 
@@ -457,11 +727,81 @@ export const RATIONALE_PARTS_COVERED = ["Requirement", "Evidence", "Alignment"] 
  */
 export const RATIONALE_PART_ALSO = "Also";
 
+/**
+ * The same three sentences, named for a clause nothing could be decided about.
+ *
+ * `not_assessable` is the one verdict where "Gap / Impact / Fix" is not merely
+ * unhelpful but wrong. The verdict means the architecture *does* engage the
+ * requirement and the record needed to judge it — an approval, a policy, a
+ * stated figure — is not in the document. There is no gap in the design to
+ * report and nothing in the design to fix: the action is to go and ask the
+ * document's author for the missing record.
+ *
+ * The stored findings write that shape with unusual consistency — "the design
+ * engages X but does not provide evidence of Y", "without these records,
+ * compliance cannot be confirmed", "obtain and document Y to satisfy the
+ * clause" — so these three name what is actually in the three sentences. 131
+ * of this workspace's 155 not-assessable findings were labelled "Gap" and
+ * "Fix" before this, telling a reviewer to go and change an architecture that
+ * may well be correct.
+ */
+export const RATIONALE_PARTS_UNASSESSABLE = ["Missing", "Why it blocks", "To resolve"] as const;
+
 /** Labels for a verdict: a passing clause is described, not remediated. */
 export function rationaleLabels(verdict: string): readonly string[] {
-  return verdict === "covered" || verdict === "not_applicable"
-    ? RATIONALE_PARTS_COVERED
-    : RATIONALE_PARTS;
+  if (verdict === "covered" || verdict === "not_applicable") return RATIONALE_PARTS_COVERED;
+  // Not a gap in the design — a gap in the record. See the constant above.
+  if (verdict === "not_assessable") return RATIONALE_PARTS_UNASSESSABLE;
+  return RATIONALE_PARTS;
+}
+
+/**
+ * The marker the analyse stage leaves when a clause was never actually judged.
+ *
+ * `Workers/aidp/stages/analyse.py` records a failed model call as a
+ * `needs_review` finding whose rationale says so. That is the right record to
+ * keep — the clause genuinely has no verdict and the report must not pretend
+ * otherwise — but it is not a judgement, and rendering it as one puts an API
+ * failure in a compliance report in the voice of a reviewer.
+ *
+ * Worse, until the fix alongside this one that line interpolated the raw
+ * provider payload, so 596 of this workspace's findings currently end in
+ * `(400: {"error":{"message":"Provider returned error",...}}`. The worker no
+ * longer writes that, but the stored findings still carry it and will until
+ * they are re-run, so the tail is stripped on the way to the screen rather
+ * than only at the source.
+ *
+ * Returns the clean sentence a reader can act on, or null when the rationale
+ * is an ordinary judgement.
+ */
+const NOT_JUDGED_MARKERS = [
+  // The current message, from `_judge_with_readings` in analyse.py.
+  "This clause was not judged:",
+  // An older one, no longer written but still stored on 14 findings here.
+  "The model could not be reached for this clause",
+];
+
+/**
+ * Where the human sentence ends and the machine's complaint begins.
+ *
+ * Three shapes appear in the stored findings, and the diagnostic always opens
+ * with one of them: a parenthesis — `(400: {…}`, `(the platform's model key
+ * was rejected by the provider (401): {…}` — a bare status code after a colon,
+ * or the payload itself. Matching whichever comes first is safe here because
+ * this is only ever applied to a machine-written template whose own prose
+ * contains none of the three.
+ */
+const DIAGNOSTIC_TAIL = /\s*(?:\(|:\s*\d{3}\b|\{")[\s\S]*$/;
+
+export function notJudged(rationale: string): string | null {
+  const trimmed = rationale.trim();
+  if (!NOT_JUDGED_MARKERS.some((marker) => trimmed.startsWith(marker))) return null;
+  // Strip the diagnostic, then any unbalanced remnant of one: a payload cut to
+  // a fixed width can leave an opening parenthesis with nothing to close it.
+  let clean = trimmed.replace(DIAGNOSTIC_TAIL, "").replace(/\s*\($/, "").trim();
+  if (!clean) return trimmed;
+  if (!/[.!?]$/.test(clean)) clean += ".";
+  return clean;
 }
 
 /**
@@ -569,6 +909,10 @@ export function rationaleSections(
   rationale: string,
   verdict: string,
 ): { label: string; text: string }[] | null {
+  // Never labelled: this is a record of a failed call, not an argument, and
+  // "Gap"/"Fix" over an API error is the engine speaking in a reviewer's voice.
+  if (notJudged(rationale)) return null;
+
   const sentences = splitSentences(rationale);
   const labels = rationaleLabels(verdict);
   const [gap, impact, fix] = labels;
@@ -747,6 +1091,58 @@ export function readEvidence(value: unknown): EvidenceItem[] {
           typeof row.breachQuote === "string" && row.breachQuote.trim()
             ? row.breachQuote.trim()
             : null,
+      },
+    ];
+  });
+}
+
+/** A reading that disagreed with the verdict that was stored. */
+export type Dissent = { verdict: string; rationale: string };
+
+/**
+ * How the readings of one clause voted, as a reviewer should be told it.
+ *
+ * The engine judges each clause more than once and keeps what most readings
+ * said, because a model does not answer the same question the same way twice
+ * and an assessment that moves between Tuesday and Thursday is not one an
+ * architecture board can be shown. See `_vote` in
+ * Workers/aidp/stages/analyse.py.
+ *
+ * Having done that, the report has to say so. "Three of three readings agreed"
+ * and "two of three" are different claims about how settled a finding is, and
+ * a reviewer deciding what to look at first is entitled to the difference —
+ * it is a better guide to where their attention is worth spending than any
+ * confidence number the model reports about itself.
+ *
+ * Null when there was nothing to vote on: one reading, or a finding written
+ * before the engine took more than one, which is the same thing and reads the
+ * same way.
+ */
+export function agreementOf(
+  readings: number,
+  agreed: number,
+): { label: string; unanimous: boolean } | null {
+  if (!Number.isFinite(readings) || readings <= 1) return null;
+  const unanimous = agreed >= readings;
+  return {
+    label: unanimous
+      ? `All ${readings} readings of this clause agreed.`
+      : `${agreed} of ${readings} readings reached this verdict.`,
+    unanimous,
+  };
+}
+
+/** The readings that disagreed, in the shape they were stored. */
+export function dissentOf(value: unknown): Dissent[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    if (!item || typeof item !== "object") return [];
+    const row = item as Record<string, unknown>;
+    if (typeof row.verdict !== "string" || !row.verdict) return [];
+    return [
+      {
+        verdict: row.verdict,
+        rationale: typeof row.rationale === "string" ? row.rationale : "",
       },
     ];
   });

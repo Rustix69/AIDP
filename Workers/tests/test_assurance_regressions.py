@@ -183,7 +183,7 @@ ok(
 )
 ok(
     "every passage still names the design it came from",
-    "documentId" in __import__("inspect").getsource(analyse._judge_by_search),
+    "documentId" in __import__("inspect").getsource(analyse._judged_from),
 )
 ok(
     "and each design is searched in its own window",

@@ -28,7 +28,13 @@ const TONE: Record<"good" | "bad" | "neutral", string> = {
 };
 
 function formatDate(value: Date | string): string {
-  return new Date(value).toLocaleDateString(undefined, {
+  // Pinned rather than the viewer's locale, as DesignResult does.
+  // `undefined` means "whatever locale this runtime has", and a client
+  // component is rendered twice on two runtimes: Node writes "7 Nov 2026" and
+  // the browser writes "Nov 7, 2026", which React reports as a hydration
+  // mismatch and repairs by throwing away and re-rendering the whole subtree.
+  // On this page that now happens on every poll.
+  return new Date(value).toLocaleDateString("en-GB", {
     day: "numeric",
     month: "short",
     year: "numeric",

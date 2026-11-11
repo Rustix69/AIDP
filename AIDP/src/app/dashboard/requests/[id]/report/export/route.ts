@@ -14,8 +14,8 @@ import {
   BRIEF_SEVERITY_LABEL,
   OBLIGATION_META,
   VERDICT_META,
-  briefSeverityOf,
-  readObligation,
+  effectiveFinding,
+  notJudged,
   type BriefSeverity,
 } from "@/lib/ingest/verdicts";
 
@@ -103,10 +103,12 @@ export async function GET(
   ]);
   if (!run) return NextResponse.json({ error: "not found" }, { status: 404 });
 
-  const graded = findings.map((finding) => ({
-    finding,
-    grade: briefSeverityOf(finding.verdict, readObligation(finding.obligation)),
-  }));
+  // The same resolution the on-screen report uses. An exported .docx that
+  // disagreed with the page it was exported from would be the worst of the two.
+  const graded = findings.map((finding) => {
+    const effective = effectiveFinding(finding);
+    return { finding, effective, grade: effective.brief };
+  });
   const counts: Record<BriefSeverity, number> = { critical: 0, high: 0, medium: 0, low: 0 };
   let unsettled = 0;
   for (const { grade } of graded) {
@@ -121,6 +123,9 @@ export async function GET(
       clauseRef: f.clauseRef,
       verdict: f.verdict,
       obligation: f.obligation,
+      reviewerVerdict: f.reviewerVerdict,
+      reviewerObligation: f.reviewerObligation,
+      reviewerSeverity: f.reviewerSeverity,
     })),
     readAdvice(run.advice),
     readLifecycle(run.lifecycle),
@@ -162,29 +167,46 @@ export async function GET(
 
   // --- 2. What was breached ------------------------------------------------
   const sheet = workbook.addWorksheet("Findings");
+  // Two columns carry the engine's own answer beside the one in force. An
+  // audit of a compliance tool asks where its reports disagreed with it and who
+  // said so, and a sheet that silently printed the corrected value could not be
+  // used to answer either question.
   header(sheet, [
     ["Clause", 18], ["Title", 40], ["Verdict", 16], ["Severity", 12],
-    ["Settled", 10], ["Obligation", 14], ["Reviewed", 14], ["Rationale", 90],
+    ["Settled", 10], ["Obligation", 14], ["Reviewed", 14],
+    ["Engine verdict", 16], ["Corrected by", 24], ["Rationale", 90],
   ]);
   const ordered = [...graded].sort((a, b) => {
     const left = a.grade ? SEVERITY_ORDER[a.grade.tier] : 9;
     const right = b.grade ? SEVERITY_ORDER[b.grade.tier] : 9;
     return left - right || a.finding.clauseRef.localeCompare(b.finding.clauseRef);
   });
-  for (const { finding, grade } of ordered) {
+  for (const { finding, effective, grade } of ordered) {
     sheet.addRow({
       Clause: finding.clauseRef,
       Title: finding.clauseTitle,
-      Verdict: VERDICT_META[finding.verdict as keyof typeof VERDICT_META]?.label ?? finding.verdict,
+      Verdict:
+        VERDICT_META[effective.verdict as keyof typeof VERDICT_META]?.label ??
+        effective.verdict,
       Severity: grade ? BRIEF_SEVERITY_LABEL[grade.tier] : "—",
       // The column exists so "Low" is never read as "small" without the
       // qualifier the engine attached to it.
       Settled: grade ? (grade.settled ? "yes" : "no") : "—",
       Obligation:
-        OBLIGATION_META[readObligation(finding.obligation)]?.label ??
-        String(finding.obligation),
+        OBLIGATION_META[effective.obligation]?.label || effective.obligation,
       Reviewed: finding.reviewerState,
-      Rationale: finding.rationale,
+      // Em dash where nobody disagreed, so the column reads as a list of
+      // corrections rather than as the verdict printed twice.
+      "Engine verdict": effective.corrected.verdict
+        ? (VERDICT_META[effective.engine.verdict as keyof typeof VERDICT_META]?.label ??
+          effective.engine.verdict)
+        : "—",
+      "Corrected by": effective.edited ? finding.editedByName || "a reviewer" : "—",
+      // A clause the engine never answered carries a record of the failed call
+      // rather than a judgement, and until the worker fix that record ended in
+      // the provider's own `{"error":{...}}` payload. This is the file a client
+      // opens, so the raw tail is stripped here exactly as it is on screen.
+      Rationale: notJudged(effective.rationale) ?? effective.rationale,
     });
   }
 

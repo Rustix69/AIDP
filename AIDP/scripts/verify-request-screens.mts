@@ -22,9 +22,10 @@
  * Needs the app running:  npm run dev
  * Run with:  npx tsx --env-file=.env.local scripts/verify-request-screens.mts
  */
+import { randomUUID } from "node:crypto";
 import { prisma } from "../src/lib/prisma";
 import { provisionAccount } from "../src/lib/access/provision";
-import { createRequest, updateRequest } from "../src/lib/ingest/requests";
+import { createRequest, markDiagram, updateRequest } from "../src/lib/ingest/requests";
 import type { Access } from "../src/lib/access/gate";
 
 const BASE = process.env.BASE_URL ?? "http://localhost:3000";
@@ -188,6 +189,107 @@ try {
   ok(
     "and what was answered drops off the outstanding list",
     !filled.body.includes("the hosting and deployment environment"),
+  );
+
+  // --- the diagram, and the reading that fills Group C in ------------------
+  //
+  // What can be checked here is what the *server* decided: the submission gate,
+  // and the proposals it sent down. The panel's own wording lives inside a
+  // Client Component and never appears in this response — see the note at the
+  // top of this file — so none of it is asserted on.
+  console.log("\nThe diagram and the reading");
+
+  // Group A and B first. A diagram lifts Group C and nothing else, so without
+  // these the gate stays shut for reasons that have nothing to do with it.
+  await updateRequest(access, id, {
+    plannedStart: "2027-03-01",
+    problemStatement: "The current portal is out of support.",
+  });
+
+  const beforeDiagram = await get(`/dashboard/requests/${id}`, cookie);
+  ok(
+    "without a diagram, the unanswered Group C questions still block",
+    beforeDiagram.body.includes("Still needed before this can be submitted") &&
+      beforeDiagram.body.includes("the data stores used"),
+  );
+
+  const diagramDoc = await prisma.document.create({
+    data: {
+      organisationId: access.organisation.id,
+      projectId: (await prisma.architectureRequest.findUniqueOrThrow({ where: { id } })).projectId,
+      role: "assessed",
+      title: "Portal context diagram.png",
+      storageKey: `verify/${randomUUID()}`,
+      mimeType: "image/png",
+      byteSize: 1,
+      sha256: randomUUID(),
+      status: "ready",
+      uploadedById: access.user.id,
+    },
+    select: { id: true },
+  });
+
+  await markDiagram(access, id, diagramDoc.id);
+  const withDiagram = await get(`/dashboard/requests/${id}`, cookie);
+  ok("the page still renders with a diagram nominated", withDiagram.status === 200);
+  ok(
+    "the diagram lifts the Group C block",
+    !withDiagram.body.includes("Still needed before this can be submitted"),
+  );
+  // The brief's rule relaxes the gate; this is the part that keeps it honest.
+  // Three of the nine significance categories read these fields, and an
+  // unanswered question never triggers one.
+  ok(
+    "and the page says what the submission would go in without",
+    withDiagram.body.includes("This can be submitted on its diagram") &&
+      withDiagram.body.includes("the data stores used"),
+  );
+
+  // A reading, written as the worker writes one. Its proposals are props of the
+  // wizard, so they do travel in this response.
+  await prisma.intakeReading.create({
+    data: {
+      organisationId: access.organisation.id,
+      requestId: id,
+      state: "ready",
+      model: "verify/none",
+      readDocumentIds: [diagramDoc.id],
+      proposals: [
+        {
+          field: "dataClassification",
+          value: "Confidential",
+          documentId: diagramDoc.id,
+          documentTitle: "Portal context diagram.png",
+          section: "2 Data",
+          page: 2,
+          quote: "All customer records are classified Confidential.",
+        },
+      ],
+    },
+  });
+
+  const withReading = await get(`/dashboard/requests/${id}`, cookie);
+  ok("the proposal reaches the screen", withReading.body.includes("Confidential"));
+  ok(
+    "with the design's own words behind it",
+    withReading.body.includes("All customer records are classified Confidential."),
+  );
+  ok(
+    "and where they came from",
+    withReading.body.includes("Portal context diagram.png") &&
+      withReading.body.includes("2 Data"),
+  );
+
+  // A submitted request stops offering a reading, because its answers are the
+  // thing that was assessed. The page must still render.
+  await prisma.intakeReading.deleteMany({ where: { requestId: id } });
+  await markDiagram(access, id, null);
+  await prisma.document.delete({ where: { id: diagramDoc.id } });
+
+  const afterRemoval = await get(`/dashboard/requests/${id}`, cookie);
+  ok(
+    "and removing the diagram closes the gate again",
+    afterRemoval.body.includes("Still needed before this can be submitted"),
   );
 
   // --- a submitted request is a different screen --------------------------

@@ -82,8 +82,19 @@ export const config = {
    * The remaining /api routes are matched but are not under a PRIVATE prefix,
    * so they pass through and are refused by their own `requireAccess`. That is
    * right: an API answers 401, it does not redirect a fetch to an HTML page.
+   *
+   * `_next` is excluded whole rather than `_next/static` and `_next/image`
+   * only. Nothing private is served from under it, so matching the rest bought
+   * nothing — while in development the dev server's own traffic lives there
+   * too, including the hot-reload socket at `/_next/webpack-hmr`. Putting a
+   * Node proxy in front of a WebSocket upgrade is a good way to have the
+   * hot-reload client fail to come up, and when it does, Next stops patching
+   * the page and starts reloading it outright: the tab reloads, reloads again,
+   * and eventually settles on the real screen. `_next/data` is named anyway
+   * because Next runs proxy for those regardless of the matcher, and this file
+   * passes them through on purpose.
    */
   matcher: [
-    "/((?!_next/static|_next/image|api/auth|api/internal|favicon.ico|.*\\.(?:png|jpg|jpeg|gif|webp|svg|ico|woff2?)$).*)",
+    "/((?!_next/|api/auth|api/internal|favicon.ico|.*\\.(?:png|jpg|jpeg|gif|webp|svg|ico|woff2?)$).*)",
   ],
 };

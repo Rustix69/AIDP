@@ -11,7 +11,7 @@
  * the rows.
  */
 import { readCoverage, type CoverageView } from "./coverage";
-import { readEvidence, type EvidenceItem } from "./verdicts";
+import { effectiveFinding, readEvidence, type EvidenceItem } from "./verdicts";
 
 /** The clause verdicts a result lists, worst first. "absent" is not one of them. */
 export const LISTED = ["contradicts", "partial", "needs_review", "covered"] as const;
@@ -61,11 +61,15 @@ export type CompletedRun = {
     clauseTitle: string;
     clauseStatement: string;
     verdict: string;
+    obligation: string;
     confidence: number;
     rationale: string;
     evidence: unknown;
     reviewerState: string;
     reviewerVerdict: string | null;
+    reviewerObligation: string | null;
+    reviewerSeverity: string | null;
+    reviewerRationale: string | null;
   }[];
 };
 
@@ -76,10 +80,23 @@ function isListed(verdict: string): verdict is Listed {
 export function designResult(run: CompletedRun, superseding = false): DesignResult {
   const findings = run.findings
     .flatMap((finding): ResultFinding[] => {
-      const { verdict } = finding;
+      // What the finding says now, not what the engine first said. This panel
+      // is the read-only twin of the report on the design's own page, and the
+      // two showing different verdicts for one clause would be worse than
+      // either — a reviewer who corrected something on one screen would find it
+      // uncorrected on the other and not know which to believe.
+      const effective = effectiveFinding(finding);
+      const verdict = effective.verdict as string;
       // A clause the design is silent on is not reported; see coverage.ts.
       if (!isListed(verdict)) return [];
-      return [{ ...finding, verdict, evidence: readEvidence(finding.evidence) }];
+      return [
+        {
+          ...finding,
+          verdict,
+          rationale: effective.rationale,
+          evidence: readEvidence(finding.evidence),
+        },
+      ];
     })
     .sort(
       (a, b) =>

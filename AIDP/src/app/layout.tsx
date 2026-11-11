@@ -51,12 +51,26 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
+    // `suppressHydrationWarning` sits on <html> and on <body>, for two
+    // different reasons. On <html>: the boot script below writes `data-theme`
+    // on this element before React hydrates, so the client tree never matches
+    // the server's on that one attribute — which is the whole point of the
+    // script, and which React otherwise reported as a hydration mismatch on
+    // every single page load. On <body>: browser extensions write their own
+    // attributes onto it before React gets there — ColorZilla leaves
+    // `cz-shortcut-listen`, Grammarly leaves `data-gr-*` — and React reports
+    // that as a mismatch in our markup, on the landing page and everywhere
+    // else. Neither flag cascades: the children of both are still checked.
     <html
       lang="en"
       data-scroll-behavior="smooth"
+      suppressHydrationWarning
       className={`${interTight.variable} ${inter.variable} h-full antialiased`}
     >
-      <body className="grain min-h-full bg-canvas font-sans text-ink">
+      <body
+        className="grain min-h-full bg-canvas font-sans text-ink"
+        suppressHydrationWarning
+      >
         {/* Before anything paints: reads the stored theme and puts it on
             <html>. It is blocking and it runs ahead of the markup below on
             purpose — the alternative is doing it in React, which happens one

@@ -62,7 +62,25 @@ services:
       STORAGE_LOCAL_PATH: /app/.storage
       APP_BASE_URL: ${APP_BASE_URL:-http://host.docker.internal:3000}
       WORKER_SHARED_SECRET: ${WORKER_SHARED_SECRET:-}
-      # A run is one model call per clause — a hundred-odd for these documents.
-      # Findings commit one at a time, so a reap mid-run resumes rather than
-      # restarting, but a lease this long keeps that from happening routinely.
+      # A run is several model calls per clause — a hundred-odd clauses for
+      # these documents, each read until two readings agree. Findings commit
+      # one at a time, so a reap mid-run resumes rather than restarting, but a
+      # lease this long keeps that from happening routinely.
       LEASE_SECONDS: 3600
+      # The three knobs the analyse stage actually turns, surfaced here so they
+      # can be set for one run without editing .env — which is what an A/B
+      # against samples/ANSWER_KEY.md needs:
+      #
+      #   JUDGE_READINGS=1 ASSESS_CONCURRENCY=8 docker compose up -d analyse
+      #
+      # Empty means the default in config.py (3 readings, 8 at once, whole
+      # document when it fits).
+      # The model the *verdicts* are reached with, which is worth separating
+      # from the one that describes figures and reads a standard's rules: the
+      # judge is the quality-critical call, and the clause set has to be held
+      # constant to compare two judges against samples/ANSWER_KEY.md at all.
+      # Defaults to the .env model, so leaving it alone changes nothing.
+      OPENROUTER_MODEL: ${JUDGE_MODEL:-openai/gpt-4.1-mini}
+      JUDGE_READINGS: ${JUDGE_READINGS:-}
+      ASSESS_CONCURRENCY: ${ASSESS_CONCURRENCY:-}
+      PREFER_WHOLE_DOCUMENT: ${PREFER_WHOLE_DOCUMENT:-}

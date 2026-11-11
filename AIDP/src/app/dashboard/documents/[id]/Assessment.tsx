@@ -9,6 +9,7 @@ import {
   CircleHelp,
   CircleSlash,
   Loader2,
+  PencilLine,
   Play,
   Scale,
   ShieldAlert,
@@ -21,14 +22,17 @@ import {
   VERDICT_META,
   applyLens,
   clauseAddress,
+  effectiveFinding,
+  notJudged,
   rationaleSections,
-  severityOf,
   type EvidenceItem,
   type Lens,
   type Obligation,
   type Verdict,
   type VerdictCounts,
 } from "@/lib/ingest/verdicts";
+import type { EditEvent } from "@/lib/ingest/finding-edit-plan";
+import { DRAFT_STATE_META, type DraftState } from "@/lib/ingest/standards-vocabulary";
 import {
   type AppliedDecision,
   type DecisionScope,
@@ -47,9 +51,7 @@ import type { AdviceView } from "@/lib/ingest/advice";
 import type { LifecycleView } from "@/lib/ingest/lifecycle";
 import { SLOW_PICKUP_MS, type JobView } from "@/lib/ingest/pipeline";
 import {
-  applyStandard,
   cancelAssessment,
-  discardStandard,
   startAssessment,
 } from "../actions";
 import { PipelineWatcher } from "../PipelineWatcher";
@@ -93,10 +95,46 @@ export type FindingView = {
   /** How strongly the clause bound, and how that was established. Severity rests on it. */
   obligation: Obligation;
   obligationSource: string;
+  /**
+   * How many independent readings of this clause were taken, and how many of
+   * them reached the verdict above.
+   *
+   * 1 and 1 is a finding from before the engine read a clause more than once,
+   * and reads the same way: one reading, agreeing with itself. See `_vote` in
+   * Workers/aidp/stages/analyse.py and `agreementOf`.
+   */
+  readings: number;
+  agreed: number;
+  /**
+   * What the readings that disagreed said — [{ verdict, rationale }].
+   *
+   * Shown rather than summarised. A reading that said "contradicts" under a
+   * majority "covered" is the most useful line on the page for whoever signs
+   * the report off, and a 2-of-3 verdict can only honestly be presented beside
+   * the thing it outvoted.
+   */
+  dissent: unknown;
   evidence: EvidenceView[];
   reviewerState: string;
   reviewerVerdict: string | null;
   reviewerNote: string | null;
+  /**
+   * A reviewer's corrections, where they made any. Null is the normal state and
+   * means the engine's answer stands; `effectiveFinding` resolves the pair and
+   * is the only thing that should read these directly.
+   */
+  reviewerObligation: string | null;
+  /** A severity a reviewer put on this directly. Null means it is derived. */
+  reviewerSeverity: string | null;
+  reviewerRationale: string | null;
+  /** Who last corrected this. Empty where nobody has. */
+  editedByName: string;
+  /**
+   * Every change made to this finding, newest first. Carried on the row rather
+   * than fetched when the dialog opens, so a reviewer never sees a spinner
+   * where the record of their own last edit should be — see `historiesForRun`.
+   */
+  history: EditEvent[];
   /** Standing decisions the model was given and said it applied. */
   appliedDecisions: AppliedDecision[];
   /** Set once this finding's review has been kept as a decision. */
@@ -119,7 +157,10 @@ export type FindingView = {
  */
 export type StandardDraft = {
   id: string;
-  state: "drafting" | "ready" | "failed" | "applied" | "discarded";
+  /** Taken from the shared vocabulary rather than spelled out again here: a
+   *  second copy of the state list is one that drifts, and the register and
+   *  this dialog have to agree about what "approved" means. */
+  state: DraftState;
   /** The lines proposed, in the words a standard would use. */
   requirements: string[];
   /** The model's one line on what the clause left unsaid. */
@@ -178,6 +219,14 @@ export type RunView = {
   /** Whether the products the design names are still supported, from endoflife.date. Facts, not a verdict. */
   lifecycle: LifecycleView | null;
 } | null;
+
+/** The severity, as the left rule on a finding row. The colours are the ones
+ *  the tag beside it uses — this is the same statement at a distance. */
+const SEVERITY_RULE: Record<string, string> = {
+  critical: "border-l-danger",
+  moderate: "border-l-warn",
+  check: "border-l-line-strong",
+};
 
 export const TONE: Record<string, string> = {
   bad: "border-danger-line bg-danger-tint text-danger",
@@ -471,7 +520,6 @@ export function Assessment({
   counts,
   findings,
   decisionsInForce,
-  mayCurate,
 }: {
   scope: Scope;
   /**
@@ -487,7 +535,6 @@ export function Assessment({
   /** Standing decisions this run will be judged with. */
   decisionsInForce: number;
   /** Whether this person may change the standards. See canManageStandards. */
-  mayCurate: boolean;
 }) {
   const router = useRouter();
   const [pending, startTransition] = useTransition();
@@ -882,7 +929,6 @@ export function Assessment({
         <FindingModal
           finding={shown[openIndex]!}
           project={project}
-          mayCurate={mayCurate}
           position={{ index: openIndex, total: shown.length }}
           onNavigate={(delta) => {
             const next = shown[openIndex + delta];
@@ -991,92 +1037,40 @@ export function Excerpt({ item }: { item: EvidenceItem }) {
 }
 
 /**
- * A proposed sharpening of one clause, and the decision to take it or not.
+ * The lines a proposed standard would add, read against what the clause already
+ * requires.
  *
- * Shown beside the finding that prompted it rather than in a queue of its own,
- * because the case for the change *is* the finding: the clause could not be
- * judged, and here is what it was missing. Read anywhere else it would be three
- * sentences with nothing behind them.
+ * Shared by the report, which shows it beside the finding that prompted it, and
+ * by the decisions register, which is where somebody acts on it. One component
+ * because the case for the change has to read the same in both places — and
+ * because the warning about standing decisions is the kind of thing that gets
+ * fixed in one copy and not the other.
  *
- * The lines are editable. What the approver settles on is what binds, and a
- * model's wording that is nearly right is faster to fix here than to reject and
- * ask for again.
+ * Read-only here. The register owns the editing, for the same reason it owns
+ * the approval: what an approver settles on is what binds, and the reviewer who
+ * proposed it is not the person who decides.
  */
-export function StandardProposal({
+export function ProposedLines({
   draft,
   clauseRef,
 }: {
   draft: StandardDraft;
   clauseRef: string;
 }) {
-  const router = useRouter();
-  const [pending, startTransition] = useTransition();
-  const [lines, setLines] = useState<string[]>(draft.requirements);
-  const [message, setMessage] = useState<string | null>(null);
-
-  const keep = lines.filter((line) => line.trim().length > 0);
-
-  const approve = () =>
-    startTransition(async () => {
-      const result = await applyStandard(draft.id, keep);
-      setMessage(result.message);
-      if (result.ok) router.refresh();
-    });
-
-  const discard = () =>
-    startTransition(async () => {
-      const result = await discardStandard(draft.id);
-      setMessage(result.message);
-      if (result.ok) router.refresh();
-    });
-
-  if (draft.state === "drafting") {
-    return (
-      <div className="mb-3 flex items-center gap-2 rounded-lg border border-line bg-canvas-sunk px-3 py-2.5 text-[12.5px] text-ink/68">
-        <Loader2 size={12} className="animate-spin text-ink/45" />
-        Working out the requirement lines {clauseRef} was missing…
-      </div>
-    );
-  }
-
-  if (draft.state === "failed") {
-    return (
-      <div className="mb-3 rounded-lg border border-warn-line bg-warn-tint px-3 py-2.5">
-        <p className="text-[12.5px] text-warn">
-          The requirement lines could not be worked out. {draft.error}
-        </p>
-        <button
-          type="button"
-          disabled={pending}
-          onClick={discard}
-          className="mt-2 text-[11.5px] text-ink/62 underline decoration-ink/25 underline-offset-2 hover:text-ink/78 disabled:opacity-50"
-        >
-          dismiss
-        </button>
-        {message && <p className="mt-1.5 text-[11.5px] text-ink/68">{message}</p>}
-      </div>
-    );
-  }
-
-  if (draft.state !== "ready") return null;
-
   return (
-    <div className="mb-3 rounded-lg border border-royal-mid/30 bg-royal/[0.06] px-3 py-3">
-      <p className="mb-1.5 flex items-center gap-1.5 text-[11.5px] text-royal">
-        <Scale size={11} />
-        Proposed for {clauseRef || "this clause"}
-      </p>
-
+    <>
       {draft.note && (
         <p className="mb-2.5 text-[12.5px] leading-relaxed text-ink/78">{draft.note}</p>
       )}
 
       {/* What the clause requires today, so the proposal is read against it
-          rather than in isolation — the commonest reason to reject a line is
+          rather than in isolation — the commonest reason to refuse a line is
           that something above already says it. */}
       {draft.existing.length > 0 && (
         <div className="mb-2.5">
-          <p className="mb-1 text-[11.5px] text-ink/62">It already requires:</p>
+          <p className="mb-1 text-[11.5px] text-ink/62">
+            {clauseRef || "This clause"} already requires:
+          </p>
           <ul className="space-y-0.5">
             {draft.existing.map((line, index) => (
               <li key={index} className="text-[12px] leading-relaxed text-ink/62">
@@ -1087,32 +1081,28 @@ export function StandardProposal({
         </div>
       )}
 
-      {lines.length > 0 ? (
-        <div className="space-y-2">
-          <p className="text-[11.5px] text-ink/62">
-            Add{lines.length === 1 ? "" : " these"}, editing the wording if you want to:
+      {draft.requirements.length > 0 ? (
+        <div>
+          <p className="mb-1 text-[11.5px] text-ink/62">
+            Proposed addition{draft.requirements.length === 1 ? "" : "s"}:
           </p>
-          {lines.map((line, index) => (
-            <textarea
-              key={index}
-              value={line}
-              disabled={pending}
-              onChange={(event) =>
-                setLines((current) =>
-                  current.map((old, at) => (at === index ? event.target.value : old)),
-                )
-              }
-              rows={2}
-              className="w-full resize-y rounded-lg border border-line bg-card px-2.5 py-2 text-[12.5px] leading-relaxed text-ink/88 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-royal-mid disabled:opacity-60"
-            />
-          ))}
+          <ul className="space-y-1">
+            {draft.requirements.map((line, index) => (
+              <li
+                key={index}
+                className="rounded-lg border border-line bg-card px-2.5 py-1.5 text-[12.5px] leading-relaxed text-ink/88"
+              >
+                {line}
+              </li>
+            ))}
+          </ul>
         </div>
       ) : (
         /* The honest answer, and a real one: a clause that was already specific
            enough needs nothing added. Said rather than shown as an empty box. */
         <p className="text-[12.5px] leading-relaxed text-ink/72">
           Nothing to add — this clause is already specific enough to judge against. The
-          partial is about the design, not the wording.
+          verdict is about the design, not the wording.
         </p>
       )}
 
@@ -1126,7 +1116,7 @@ export function StandardProposal({
               ? "One standing decision on this clause accepts an arrangement that satisfies it"
               : `${draft.decisionsInTheWay.length} standing decisions on this clause accept arrangements that satisfy it`}
             , and they will carry over to the sharper wording — so they may excuse the
-            line you are adding. Review{" "}
+            line being added. Review{" "}
             <a
               href="/dashboard/decisions"
               className="underline decoration-warn/40 underline-offset-2"
@@ -1154,32 +1144,91 @@ export function StandardProposal({
           </ul>
         </details>
       )}
+    </>
+  );
+}
 
-      <div className="mt-3 flex flex-wrap items-center gap-2">
-        <button
-          type="button"
-          disabled={pending || keep.length === 0}
-          onClick={approve}
-          className="rounded-full bg-royal px-3.5 py-1.5 text-[12px] font-medium text-white transition-colors hover:bg-royal-mid disabled:opacity-40"
-        >
-          {keep.length === 1 ? "Add this requirement" : `Add ${keep.length} requirements`}
-        </button>
-        <button
-          type="button"
-          disabled={pending}
-          onClick={discard}
-          className="text-[12px] text-ink/62 hover:text-ink/78 disabled:opacity-50"
-        >
-          discard
-        </button>
-        {/* Said before the press, not after: a reader deciding whether to click
-            needs to know the old wording survives. */}
-        <span className="text-[11px] text-ink/54">
-          Kept as a new version. The earlier wording stays on the record.
-        </span>
+/**
+ * Where a proposed standard has got to, shown beside the finding it came from.
+ *
+ * Status only. Approving a standard and publishing it both happen in the
+ * decisions register, and they happen there rather than here for a reason the
+ * client asked for directly: a proposal is written by whoever is reviewing the
+ * report, and signed off by whoever administers the library. Those are usually
+ * two different people, and the second one is not reading this report — they
+ * are looking at a list of what is waiting on them.
+ *
+ * So this says what happened to the thing the reviewer sent, and points at the
+ * place it went.
+ */
+export function StandardProposal({
+  draft,
+  clauseRef,
+}: {
+  draft: StandardDraft;
+  clauseRef: string;
+}) {
+  if (draft.state === "drafting") {
+    return (
+      <div className="mb-3 flex items-center gap-2 rounded-lg border border-line bg-canvas-sunk px-3 py-2.5 text-[12.5px] text-ink/68">
+        <Loader2 size={12} className="animate-spin text-ink/45" />
+        Drafting the standard {clauseRef} was missing…
       </div>
+    );
+  }
 
-      {message && <p className="mt-2 text-[11.5px] text-ink/72">{message}</p>}
+  if (draft.state === "failed") {
+    return (
+      <div className="mb-3 rounded-lg border border-warn-line bg-warn-tint px-3 py-2.5">
+        <p className="text-[12.5px] text-warn">
+          The requirement lines could not be worked out. {draft.error}
+        </p>
+        <p className="mt-1 text-[11.5px] text-ink/68">
+          It can be dismissed from{" "}
+          <a
+            href="/dashboard/decisions"
+            className="underline decoration-ink/25 underline-offset-2"
+          >
+            Decisions
+          </a>
+          .
+        </p>
+      </div>
+    );
+  }
+
+  if (draft.state !== "ready" && draft.state !== "approved") return null;
+
+  const meta = DRAFT_STATE_META[draft.state];
+
+  return (
+    <div className="mb-3 rounded-lg border border-royal-mid/30 bg-royal/[0.06] px-3 py-3">
+      <p className="mb-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11.5px] text-royal">
+        <Scale size={11} />
+        Standard proposed for {clauseRef || "this clause"}
+        <span
+          className={cn(
+            "rounded px-1.5 py-0.5",
+            draft.state === "approved" ? "bg-ok-tint text-ok" : "bg-card text-ink/68",
+          )}
+        >
+          {meta.label}
+        </span>
+      </p>
+
+      <ProposedLines draft={draft} clauseRef={clauseRef} />
+
+      <p className="mt-2.5 text-[11.5px] leading-relaxed text-ink/64">
+        {draft.state === "approved"
+          ? "The wording is agreed. It joins the standard when an administrator publishes it."
+          : "Waiting for an administrator to review the wording."}{" "}
+        <a
+          href="/dashboard/decisions"
+          className="underline decoration-ink/25 underline-offset-2 hover:text-ink/82"
+        >
+          Open Decisions
+        </a>
+      </p>
     </div>
   );
 }
@@ -1312,10 +1361,27 @@ function FindingRow({
   /** Opens the shared dialog on this finding. See `openId` in Assessment. */
   onOpen: () => void;
 }) {
-  const meta = VERDICT_META[finding.verdict as Verdict] ?? VERDICT_META.needs_review;
-  const severity = severityOf(finding.verdict, finding.obligation);
+  // What this finding says now: the engine's answer where nobody has touched
+  // it, the reviewer's where they have. The row has to agree with the register
+  // strip above it and the report that will be exported from it, and all three
+  // now ask the same function.
+  const effective = effectiveFinding(finding);
+  const meta = VERDICT_META[effective.verdict as Verdict] ?? VERDICT_META.needs_review;
+  const severity = effective.severity;
   const decided = finding.reviewerState !== "pending";
   const draft = finding.draft;
+  /**
+   * A correction the "Verdict corrected" chip does not already announce.
+   *
+   * Grading a finding, or sharpening the obligation behind its grade, moves the
+   * severity without changing the verdict — so without this a row would quietly
+   * read Critical where the engine had said Check and nothing on it would say a
+   * person had made that call.
+   */
+  const quietlyEdited =
+    effective.corrected.obligation ||
+    effective.corrected.severity ||
+    effective.corrected.rationale;
 
   /**
    * The gap alone, which is the first of the three sentences the judge writes.
@@ -1326,8 +1392,18 @@ function FindingRow({
    * before the rule — the whole of it is shown and clamped, which is what the
    * row did before. See `rationaleParts`.
    */
-  const sections = rationaleSections(finding.rationale, finding.verdict);
-  const gap = sections ? sections[0].text : finding.rationale;
+  const sections = rationaleSections(effective.rationale, effective.verdict);
+  /**
+   * A clause the engine never reached an answer on.
+   *
+   * The strip shows the gap, and a finding like this has none: what it has is
+   * a failed model call recorded so the clause is not silently counted as
+   * judged. Shown as the plain sentence it is, with the provider's own error
+   * payload stripped — 596 stored findings still carry a raw
+   * `{"error":{...}}` tail from before the worker stopped writing one.
+   */
+  const unjudged = notJudged(effective.rationale);
+  const gap = unjudged ?? (sections ? sections[0].text : effective.rationale);
 
   /**
    * An accepted risk: the breach stands, allowed for this project alone.
@@ -1351,11 +1427,19 @@ function FindingRow({
         onClick={onOpen}
         aria-haspopup="dialog"
         className={cn(
-          "flex w-full items-center gap-3 rounded-xl border px-3.5 py-2.5 text-left transition-colors",
+          "flex w-full items-center gap-3 rounded-xl border border-l-4 px-3.5 py-2.5 text-left transition-colors",
           "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-royal-mid",
           decided
             ? "border-line bg-canvas-sunk/60 hover:bg-canvas-sunk"
             : "border-line bg-card hover:border-line-strong",
+          // The severity, as a rule down the left edge — the client's
+          // prototype's one treatment for a finding, and the only part of a
+          // row that survives being scrolled past. The chip and the tag still
+          // say it in words; this is what makes a column of eighty readable at
+          // arm's length. A settled row keeps the rule but not its weight:
+          // what it was still matters, what it needs no longer does.
+          SEVERITY_RULE[severity ?? "check"],
+          decided && "border-l-line-strong",
         )}
       >
         <span
@@ -1468,6 +1552,15 @@ function FindingRow({
           )}
           {draft?.state === "drafting" && (
             <Loader2 size={11} className="animate-spin text-ink/45" />
+          )}
+          {quietlyEdited && (
+            <span
+              className="hidden items-center gap-1 rounded bg-canvas-sunk px-1.5 py-0.5 text-ink/68 sm:inline-flex"
+              title={`Edited by ${finding.editedByName || "a reviewer"}`}
+            >
+              <PencilLine size={10} aria-hidden="true" />
+              edited
+            </span>
           )}
           {severity && <SeverityTag severity={severity} />}
           <ChevronRight size={14} className="text-ink/40" aria-hidden="true" />

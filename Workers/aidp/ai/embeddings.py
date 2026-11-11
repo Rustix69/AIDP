@@ -38,6 +38,22 @@ InputType = Literal["document", "query"]
 BATCH_SIZE = 96
 TIMEOUT = httpx.Timeout(120.0, connect=15.0)
 
+# A ceiling on one input, in characters.
+#
+# Every provider caps a single input — OpenAI's text-embedding-3-* at 8192
+# tokens — and rejects the whole batch when one input is over, so one oversized
+# passage costs up to ninety-six other people's chunks and fails the document.
+# The chunker bounds what it produces (see _MAX_TABLE_CHARS there); this is the
+# backstop for everything it cannot foresee, and it degrades one passage to its
+# opening instead of failing the index.
+#
+# Two and a half characters per token, against the four that English prose
+# actually runs at. Deliberately pessimistic: the text that reaches this line
+# is the text that got unusually large, which is normally a grid of identifiers
+# and numbers, and those tokenise far worse than prose.
+MAX_INPUT_TOKENS = 8192
+MAX_INPUT_CHARS = int(MAX_INPUT_TOKENS * 2.5)
+
 
 class EmbeddingProvider(Protocol):
     model: str
@@ -290,6 +306,16 @@ def embed_all(texts: list[str], input_type: InputType = "document") -> list[list
     """
     if not texts:
         return []
+
+    oversized = sum(1 for text in texts if len(text) > MAX_INPUT_CHARS)
+    if oversized:
+        logs.warn(
+            log,
+            "passages truncated to fit the provider's input limit",
+            count=oversized,
+            limit_chars=MAX_INPUT_CHARS,
+        )
+        texts = [text[:MAX_INPUT_CHARS] for text in texts]
 
     cfg = get_config()
     prov = provider()

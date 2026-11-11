@@ -1,7 +1,13 @@
 import { prisma } from "@/lib/prisma";
 import { requireMembership } from "./org";
 import { describeJob, JOB_SELECT } from "./pipeline";
-import { emptyCounts, VERDICTS, type Verdict, type VerdictCounts } from "./verdicts";
+import {
+  effectiveFinding,
+  emptyCounts,
+  VERDICTS,
+  type Verdict,
+  type VerdictCounts,
+} from "./verdicts";
 
 // Re-exported so server callers have one import for the whole area; client
 // components must import from ./verdicts directly, since this file reaches
@@ -281,17 +287,32 @@ export async function latestRun(userId: string, documentId: string) {
   return { ...run, orphaned, job: row && !orphaned ? describeJob(row) : null };
 }
 
+/**
+ * The run's scorecard, counted on what each finding says *now*.
+ *
+ * Not a `groupBy` on the verdict column any more, and the reason is the whole
+ * point of the editor: a reviewer who corrects `contradicts` to `covered` is
+ * telling the report the design does not breach that clause, and a strip that
+ * kept counting the engine's answer would go on saying it does. The column
+ * cannot answer this on its own, because the correction lives beside it.
+ *
+ * So the rows come back and `effectiveFinding` resolves each one. A run is a
+ * hundred-odd findings of two short columns; the grouping was never the
+ * expensive part of drawing this screen.
+ */
 export async function verdictCounts(runId: string): Promise<VerdictCounts> {
-  const rows = await prisma.finding.groupBy({
-    by: ["verdict"],
+  const rows = await prisma.finding.findMany({
     where: { runId },
-    _count: { _all: true },
+    select: { verdict: true, reviewerVerdict: true },
   });
   const counts = emptyCounts();
   for (const row of rows) {
-    if ((VERDICTS as readonly string[]).includes(row.verdict)) {
-      counts[row.verdict as Verdict] = row._count._all;
-    }
+    // Counted only where the verdict is one this build has a column for, which
+    // is what the `groupBy` this replaced did. A verdict from a newer engine
+    // has nowhere to go in a fixed-shape tally, and inventing a home for it
+    // would put it under a heading it does not belong to.
+    const { verdict } = effectiveFinding(row);
+    if ((VERDICTS as readonly string[]).includes(verdict)) counts[verdict as Verdict] += 1;
   }
   return counts;
 }

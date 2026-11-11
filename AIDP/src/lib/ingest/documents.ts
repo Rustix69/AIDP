@@ -1,6 +1,8 @@
 import { prisma } from "@/lib/prisma";
 import { requireMembership } from "./org";
 import { describePipeline, JOB_SELECT, STAGES, type JobRow } from "./pipeline";
+import { supersedeFrameworksFor } from "./assessment";
+import { remove } from "./storage";
 
 /**
  * Reads over ingested documents, always scoped to an organisation the caller
@@ -343,4 +345,69 @@ export async function sectionContent(
 
   const { document, clauses, tables, ...rest } = section;
   return { section: rest, role: document.role, lines, clauses, tables };
+}
+
+/**
+ * Take a document out of the database and the blob store.
+ *
+ * The mechanics of a deletion with **no authorisation in them** — the caller
+ * does that, because the two callers prove who they are differently: the server
+ * action resolves a session, a verification script is already running as an
+ * operator. Keeping the mechanics here is what lets a script exercise the real
+ * removal rather than approximating it with `prisma.document.delete`, which is
+ * how a verification run came to report that deleting a standard left its
+ * framework version untouched.
+ *
+ * ## The ordering matters, and it is not obvious
+ *
+ * `FrameworkDocument` cascades on the document, so the membership rows vanish
+ * with it. A framework version that loses one of its standards does not become
+ * a smaller version — it becomes a *different* version wearing the same number,
+ * and `AssessmentRun.frameworkId` still points at it. Every run already on
+ * record would then describe a scope it never measured.
+ *
+ * `supersedeFrameworksFor` therefore runs first, while there is still something
+ * to read, and retires those versions instead. `resolveFramework` cuts a fresh
+ * one on the next assessment. Nothing in the schema enforces this order; it has
+ * to be done by whoever deletes, which is exactly why there is now one place
+ * that does.
+ */
+export async function removeDocument(documentId: string): Promise<{
+  title: string;
+  role: string;
+  /** What stops being assessed against, which is the only honest measure of
+   *  what a standard's removal costs. */
+  clauses: number;
+  blobsRemoved: number;
+} | null> {
+  const document = await prisma.document.findUnique({
+    where: { id: documentId },
+    select: {
+      role: true,
+      title: true,
+      storageKey: true,
+      sections: {
+        select: {
+          _count: { select: { clauses: true } },
+          figures: { select: { storageKey: true } },
+        },
+      },
+    },
+  });
+  if (!document) return null;
+
+  // Read before the delete, because afterwards there is nothing left to read
+  // them from and the blobs are the part Postgres cannot reach.
+  const keys = [
+    document.storageKey,
+    ...document.sections.flatMap((s) => s.figures.map((f) => f.storageKey)),
+  ].filter(Boolean);
+  const clauses = document.sections.reduce((n, s) => n + s._count.clauses, 0);
+
+  if (document.role !== "assessed") await supersedeFrameworksFor(documentId);
+
+  await prisma.document.delete({ where: { id: documentId } });
+  const blobsRemoved = await remove(keys);
+
+  return { title: document.title, role: document.role, clauses, blobsRemoved };
 }

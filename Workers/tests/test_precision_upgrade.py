@@ -467,10 +467,21 @@ for label, environment, expected in (
 print("\nA judgement is asked for at temperature zero")
 
 # Verdict drift between runs of an unchanged design is the one kind of noise a
-# reviewer cannot account for, so every call that produces a verdict, a
-# confirmation, advice, coverage or a technology list is asked at zero. The two
-# rules readings are the deliberate exception: they are a cross-check, and at
-# zero they would make the same mistakes and agree for the wrong reason.
+# reviewer cannot account for, so every call that produces a confirmation,
+# advice, coverage or a technology list is asked at zero.
+#
+# Two things are the deliberate exception, and they are the same exception
+# twice. The two rules readings are a cross-check, and at zero they would make
+# the same mistakes and agree for the wrong reason. The judge readings are now
+# the same arrangement applied to the verdict itself: temperature zero was
+# tried as the answer to drift and did not deliver it — two runs of one design
+# still came back 9 absent and 4 needing review, then 7 and 7, because what
+# moves a verdict is the model, not the sampler. What does deliver it is
+# reading each clause more than once and voting, and a vote between readings
+# that were drawn identically is one opinion counted three times. So the first
+# reading stays pinned — the common case is still reproducible — and the ones
+# after it are drawn separately, which is asserted below rather than left to
+# a comment.
 ok("the OpenRouter client defaults to zero",
    inspect.signature(llm.OpenRouterLLM._chat).parameters["temperature"].default == 0.0)
 ok("a Gemini call carrying a schema is zero",
@@ -479,7 +490,7 @@ ok("a Gemini call carrying a schema is zero",
 source = pathlib.Path(llm.__file__).read_text(encoding="utf-8")
 ok("Gemini's structured branch pins zero", '(0.0 if schema else 0.2)' in source)
 judgement = (
-    "def judge", "def judge_document", "def confirm_absent",
+    "def confirm_absent",
     "def suggest_improvements", "def find_uncovered", "def find_technologies",
 )
 bad: list[str] = []
@@ -493,6 +504,46 @@ for block in source.split("\n    def ")[1:]:
             if not value.startswith("0"):
                 bad.append(f"{name}: {line.strip()[:50]}")
 ok("no judgement method asks for anything else", not bad, bad)
+
+# The judge's own contract, which replaces its entry in the list above.
+first_t, first_seed = llm.judge_sampling(0)
+ok("the first reading of a clause is deterministic", (first_t, first_seed) == (0.0, llm._SEED))
+later = [llm.judge_sampling(n) for n in (1, 2, 3)]
+ok("every reading after it is sampled", all(t > 0 for t, _ in later), later)
+ok(
+    "and drawn on its own seed, so no two readings are the same draw",
+    len({seed for _, seed in later}) == len(later)
+    and all(seed != first_seed for _, seed in later),
+    later,
+)
+# A seed is only worth varying if it reaches the provider.
+ok(
+    "the seed the sampling chose is the seed that is sent",
+    '"seed": seed,' in source and "seed: int = _SEED," in source,
+)
+# Every client that really judges — not the Protocol, whose bodies are `...` —
+# has to derive its temperature from the reading. A client that pinned one
+# would quietly take three identical readings and vote between them.
+pinned: list[str] = []
+for block in source.split("\n    def ")[1:]:
+    name = block.split("(")[0]
+    if name not in ("judge", "judge_document"):
+        continue
+    body = block.split("\n    def ")[0]
+    if body.rstrip().endswith("...") or "...\n" in body[:400] and "self._" not in body:
+        continue  # the Protocol declaration, which has no body to pin anything in
+    if "judge_sampling(reading)" not in body:
+        pinned.append(name)
+ok(
+    "every judging client derives its temperature from the reading",
+    not pinned,
+    pinned,
+)
+ok(
+    "and all three clients were actually examined",
+    source.count("judge_sampling(reading)") == 6,
+    source.count("judge_sampling(reading)"),
+)
 ok("the first rules reading is deterministic", llm._rules_temperature(1) == 0.0)
 ok("and only the cross-check samples", llm._rules_temperature(2) > 0)
 

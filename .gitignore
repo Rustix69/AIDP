@@ -6,3 +6,14 @@
 
 # Each project keeps its own ignore rules — AIDP/.gitignore and
 # Workers/.gitignore still apply to everything under those directories.
+
+# The client's own standards registers and technology stack, and the backup
+# taken before they replaced the previous library. This repository is public —
+# see the note in AIDP/scripts/seed-satyam.mts — and a customer's standards are
+# their Internal-Use material, not ours to publish.
+/templates/
+/.backup-standards-*/
+# Not to be confused with AIDP/src/lib/standards-library/, which IS tracked:
+# that one is the product's own baseline library, written for this repository
+# and owned by us. These are a customer's. The distinction is the whole reason
+# the baseline had to be written rather than copied.

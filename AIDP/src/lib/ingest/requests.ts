@@ -510,7 +510,7 @@ export async function designTarget(
     };
   }
 
-  if (request.state !== DRAFT && request.state !== FAILED) {
+  if (!takesDesigns(request.state)) {
     return {
       error:
         "This request has been submitted, so its designs are now the thing that was assessed. A changed design is a new request.",
@@ -519,6 +519,78 @@ export async function designTarget(
   }
 
   return { projectId: request.projectId };
+}
+
+/**
+ * Is this request still taking designs, a nominated diagram, and answers?
+ *
+ * One definition, because three doors ask it — the upload route through
+ * `designTarget`, the reading through `startReading`, and `markDiagram` below.
+ * They were three copies of `state !== DRAFT && state !== FAILED` and the third
+ * one was going to be the one that forgot about `FAILED`.
+ */
+export function takesDesigns(state: string): boolean {
+  return state === DRAFT || state === FAILED;
+}
+
+/**
+ * Nominate one of the attached designs as the architecture diagram, or clear it.
+ *
+ * The brief makes the diagram a mandatory input in its own right — Group B —
+ * and hangs the Group C rule on whether one was supplied. It is a question
+ * only the requestor can answer: a .png is not necessarily the architecture
+ * diagram, a twelve-page solution document often contains it, and "the file
+ * that looks like a picture" is not a rule a governance gate should turn on. So
+ * this is a nomination, made by the person who attached the file.
+ *
+ * The document has to be one of this request's own designs. Without that check
+ * the id is a free-text field that happens to be called a document reference,
+ * and pointing it at another customer's document would be a tenancy hole rather
+ * than a mistake.
+ */
+export async function markDiagram(
+  access: Access,
+  requestId: string,
+  documentId: string | null,
+): Promise<void> {
+  const request = await prisma.architectureRequest.findFirst({
+    where: { id: requestId, organisationId: access.organisation.id },
+    select: { id: true, state: true, projectId: true, requestedById: true, documentId: true },
+  });
+  if (!request) throw new RequestRefused("That request does not exist.");
+  if (!canEditRequest(access, request)) {
+    throw new RequestRefused(
+      "Only the person who raised this request, or an administrator, can change it.",
+    );
+  }
+  if (!takesDesigns(request.state)) {
+    throw new RequestRefused(
+      "This request has been submitted, so what it was assessed on cannot change.",
+    );
+  }
+
+  if (documentId !== null) {
+    const attached = await prisma.document.findFirst({
+      where: {
+        id: documentId,
+        organisationId: access.organisation.id,
+        projectId: request.projectId,
+        role: "assessed",
+      },
+      select: { id: true },
+    });
+    // The rendered answers are not a design somebody attached, so they cannot
+    // be the diagram either — nominating them would let a request satisfy the
+    // diagram rule with the form it is trying to fill in.
+    if (!attached || attached.id === request.documentId) {
+      throw new RequestRefused("That is not one of this request's designs.");
+    }
+  }
+
+  await prisma.architectureRequest.update({
+    where: { id: request.id },
+    data: { diagramDocumentId: documentId },
+  });
 }
 
 /**
@@ -645,13 +717,62 @@ export function whatIsMissing(request: Submittable): string[] {
   if (!request.solutionOverview.trim()) missing.push("the solution overview");
 
   if (!request.diagramDocumentId) {
-    for (const { field, label } of GROUP_C) {
-      const value = request[field];
-      const empty = Array.isArray(value) ? value.length === 0 : !String(value ?? "").trim();
-      if (empty) missing.push(label);
-    }
+    for (const { label } of unanswered(request)) missing.push(label);
   }
   return missing;
+}
+
+/**
+ * The Group C questions this request has no answer to, diagram or not.
+ *
+ * Separate from `whatIsMissing` because they answer different questions.
+ * `whatIsMissing` says what stops a submission; this says what the submission
+ * will not contain. With a diagram attached those stop being the same list, and
+ * the gap between them is the thing worth saying out loud.
+ *
+ * It is worth saying because of a rule in the significance check: "an
+ * unanswered question never triggers" (see evaluate.ts). A blank Group C answer
+ * is not a quiet "no" — it is an answer nobody gave, and three of the brief's
+ * nine categories read Group C fields. A submission that takes the diagram
+ * branch and leaves four boxes empty is therefore a submission whose Major
+ * Technology Change, Security Impact and Data Architecture Impact categories
+ * had less to go on than they look like they had.
+ *
+ * The brief's rule stands — a diagram is a complete picture of the
+ * architecture, and demanding the same facts twice is the data entry this is
+ * meant to remove. What does not stand is doing that silently. The request
+ * screen prints this, and the report carries it, so "not triggered" can be read
+ * as "not triggered on what we were told" by anyone who needs to.
+ *
+ * The honest way to empty this list is the reading: `startReading` proposes
+ * these answers from the designs themselves and a person accepts them, which
+ * leaves the categories reading real answers rather than blanks.
+ */
+export function unanswered(
+  request: RenderableRequest,
+): { field: keyof RenderableRequest; label: string }[] {
+  return GROUP_C.filter(({ field }) => {
+    const value = request[field];
+    return Array.isArray(value) ? value.length === 0 : !String(value ?? "").trim();
+  });
+}
+
+/**
+ * The nominated diagram, but only while it is still one of the designs.
+ *
+ * `diagramDocumentId` carries no foreign key — deliberately, so a submitted
+ * request survives its documents being removed from the library. The cost is
+ * that a draft can point at a design somebody has since deleted, and a dangling
+ * id would hold the Group C gate open on a diagram that is not there. Both
+ * callers of `whatIsMissing` resolve the id through this first, so the gate
+ * closes again the moment the file goes.
+ */
+export function diagramOf(
+  request: { diagramDocumentId: string | null },
+  designIds: string[],
+): string | null {
+  const id = request.diagramDocumentId;
+  return id && designIds.includes(id) ? id : null;
 }
 
 /** A filename a person would recognise in the document library, and that
@@ -691,7 +812,18 @@ export async function submitRequest(
     throw new RequestRefused("This request has already been submitted.");
   }
 
-  const missing = whatIsMissing(toRenderable(request));
+  // The nominated diagram is only a diagram while the file is still attached;
+  // see `diagramOf`. Resolved here rather than trusted off the row, so a
+  // request whose diagram was deleted is gated on Group C again instead of
+  // being waved through on a dangling id.
+  const attached = await assessableDesigns(access.organisation.id, request.projectId);
+  const missing = whatIsMissing({
+    ...toRenderable(request),
+    diagramDocumentId: diagramOf(
+      request,
+      attached.filter((design) => design.id !== request.documentId).map((design) => design.id),
+    ),
+  });
   if (missing.length > 0) {
     throw new RequestRefused(
       `This request cannot be submitted yet. It still needs ${missing.join(", ")}.`,

@@ -1,0 +1,53 @@
+-- How many times a clause was read, and how many readings agreed.
+--
+-- A verdict was one model call. A model asked the same question twice does not
+-- answer it the same way twice: two runs over one design came back 9 absent and
+-- 4 needing review, then 7 and 7. For a tool whose output goes to an
+-- architecture review board that is the whole of its credibility — a reviewer
+-- who re-runs an assessment on Thursday to show their manager, and is handed a
+-- different report, stops believing both of them.
+--
+-- So a clause is now judged several times and the readings are voted on, which
+-- is what the coverage pass has always done for the parts of a design no clause
+-- governs (COVERAGE_READS), and for exactly this reason. These three columns
+-- record the vote so the report can state it rather than implying a certainty
+-- the run did not have.
+--
+--   readings  how many independent readings were taken. Readings stop early
+--             when two agree, so the ordinary clause costs two and only a
+--             contested one costs three.
+--   agreed    how many of them reached the verdict stored on this row.
+--   dissent   [{verdict, rationale}] — what the readings that disagreed said.
+--
+-- `dissent` is kept rather than discarded, for the same reason `reviewerVerdict`
+-- sits beside `verdict` rather than over it: the disagreement is the evaluation
+-- data. A minority reading of "contradicts" under a majority "covered" is the
+-- most useful line on the page for whoever has to sign the thing off.
+--
+-- Defaults of 1/1/[] are exactly the single-reading behaviour, so every finding
+-- written before this reads as what it was — one reading, agreeing with itself —
+-- and nothing is backfilled or restated.
+ALTER TABLE "finding" ADD COLUMN "readings" INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE "finding" ADD COLUMN "agreed" INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE "finding" ADD COLUMN "dissent" JSONB NOT NULL DEFAULT '[]';
+
+-- A new run decides for itself how to read the design.
+--
+-- "retrieval" shows the judge the eight passages a search ranked closest to each
+-- clause. Its dominant failure is the clause whose answer was on page 23 and did
+-- not make that window: the report says "not addressed" about something the
+-- design plainly addresses, which is the fastest way there is to lose a
+-- reviewer's trust. Reading the document whole cannot make that mistake and
+-- checks every quote word for word against the page.
+--
+-- Whether a design can be read whole is a question about its token count, which
+-- nobody pressing "assess" knows. So the default stops being an answer and
+-- becomes "auto": the worker reads a single design whole when it fits and falls
+-- back to search when it does not, saying which it did in the run's note. See
+-- _resolve_mode in Workers/aidp/stages/analyse.py.
+--
+-- The column keeps every value it had. Existing rows still say "retrieval" and
+-- still mean it, an explicit "retrieval" from the assess dialog is still
+-- honoured, and a project run still sets "retrieval" for itself — several
+-- designs concatenated would make every page number ambiguous.
+ALTER TABLE "assessment_run" ALTER COLUMN "mode" SET DEFAULT 'auto';

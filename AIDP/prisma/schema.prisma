@@ -55,7 +55,7 @@ model User {
 
   // Standing decisions this person has ruled on.
   clauseDrafts ClauseDraft[]
-  decisions Decision[]
+  decisions    Decision[]
 
   // Submissions this person has approved, sent back, or escalated.
   outcomes SubmissionOutcome[]
@@ -84,6 +84,19 @@ model User {
   // Attribution only, in both directions — see ArchitectureRequest.
   architectureRequests ArchitectureRequest[]
   reviewAssignments    ReviewAssignment[]
+
+  // Corrections they made to findings. Attribution only: the history belongs to
+  // the finding and outlives the account that wrote it.
+  findingEdits FindingEdit[]
+
+  // Standards they signed off, and standards they put into the library. Two
+  // relations because they are two acts — see ClauseDraft.
+  approvedClauseDrafts  ClauseDraft[] @relation("ClauseDraftApprover")
+  publishedClauseDrafts ClauseDraft[] @relation("ClauseDraftPublisher")
+
+  // Every technology status they changed. Append-only — see TechnologyChange.
+  technologyChanges TechnologyChange[]
+  clauseStatusChanges ClauseStatusChange[]
 
   @@map("user")
 }
@@ -166,20 +179,23 @@ model Organisation {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  memberships Membership[]
-  documents   Document[]
-  chunks      Chunk[]
-  jobs        Job[]
-  frameworks  Framework[]
-  runs        AssessmentRun[]
-  clauseDrafts ClauseDraft[]
-  decisions   Decision[]
-  outcomes    SubmissionOutcome[]
-  roster      RosterEntry[]
-  projects    Project[]
-  usage       TokenUsage[]
-  aiCache     AiCache[]
-  requests    ArchitectureRequest[]
+  memberships          Membership[]
+  documents            Document[]
+  chunks               Chunk[]
+  jobs                 Job[]
+  frameworks           Framework[]
+  runs                 AssessmentRun[]
+  clauseDrafts         ClauseDraft[]
+  clauseStatusChanges  ClauseStatusChange[]
+  technologies         Technology[]
+  decisions            Decision[]
+  outcomes             SubmissionOutcome[]
+  roster               RosterEntry[]
+  projects             Project[]
+  usage                TokenUsage[]
+  aiCache              AiCache[]
+  requests             ArchitectureRequest[]
+  intakeReadings       IntakeReading[]
   /// This customer's own significance criteria. Seeded from the default nine
   /// and editable thereafter — see SignificanceCriterion.
   significanceCriteria SignificanceCriterion[]
@@ -449,9 +465,35 @@ model Document {
   uploadedById String?
   uploadedBy   User?   @relation(fields: [uploadedById], references: [id], onDelete: SetNull)
 
-  // "reference" — a standards document; stops after embed.
-  // "assessed"  — a design submitted for review; continues into analyse.
+  // "reference"  — a standards document; stops after embed.
+  // "assessed"   — a design submitted for review; continues into analyse.
+  // "technology" — a technology stack. Ingests like a reference document
+  //                (parse, chunk, embed) so its prose stays searchable, but it
+  //                states what is *approved* rather than what is required: it
+  //                yields Technology rows instead of clauses, is never
+  //                assessed against, and is not a reference standard a
+  //                framework can be built from. Set by the parse stage from
+  //                what the file turned out to be, not by the uploader. See
+  //                the Technology model.
   role String @default("reference")
+
+  /// Which register of the product's own baseline library this copy is —
+  /// "security", "data", "integration" and so on, from REGISTERS in
+  /// lib/standards-library. Null for anything the customer brought themselves,
+  /// which is every document that was uploaded rather than seeded.
+  ///
+  /// The copy is otherwise ordinary: seeding goes through the same
+  /// `intake.record()` an upload goes through, so a seeded register parses,
+  /// chunks, embeds, is assessed against, can be edited and can be deleted
+  /// exactly as an uploaded one can. This field only says where it came from,
+  /// so the library can label it and offer it back after a delete.
+  ///
+  /// Deliberately not `isBaseline` on Framework: that models a second *layer*
+  /// assessed alongside the customer's own, and nothing writes it. What was
+  /// chosen here is replacement — a customer with their own Data standards
+  /// removes ours and uploads theirs, and `resolveFramework` picks up the
+  /// change on its own.
+  suppliedKey String?
 
   title         String
   // Cover-page identifiers, when the document carries them: "DOC-SEC-STD", "V-1.0".
@@ -511,10 +553,12 @@ model Document {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  sections DocumentSection[]
-  chunks   Chunk[]
-  jobs     Job[]
-  issues   IngestIssue[]
+  sections           DocumentSection[]
+  chunks             Chunk[]
+  jobs               Job[]
+  // Populated only for role="technology": the stack's rows.
+  technologies       Technology[]
+  issues             IngestIssue[]
   assessmentFindings Finding[]
 
   // A reference standard's text as numbered lines, and every model reading of
@@ -531,6 +575,9 @@ model Document {
   // bytes resolves to this row instead of starting the pipeline again.
   @@unique([organisationId, sha256])
   @@index([organisationId, status])
+  /// "Which of our registers is this organisation still running on?" — the one
+  /// question the library screen and the seeder both ask.
+  @@index([organisationId, suppliedKey])
   @@map("document")
 }
 
@@ -596,8 +643,33 @@ model Clause {
   // model pointed at the lines and code sliced the text (see
   // Workers/aidp/parsing/rules.py); "restored" when a reviewer promoted lines
   // the model had set aside; "authored" when a reviewer sharpened an earlier
-  // version of this clause from what an assessment found (see ClauseDraft).
+  // version of this clause from what an assessment found (see ClauseDraft);
+  // "register" when the source was a standards register — a workbook stating
+  // one standard per row, read without inference by
+  // Workers/aidp/parsing/registers.py. A register clause carries a statement
+  // and a rationale and no `requirements`, because the register states none;
+  // `sourceRefs.register` holds its identifier, category, status and owner.
   origin     String @default("parser")
+  /// Where this clause stands in this organisation's library: "active" or
+  /// "suspended". See CLAUSE_STATUSES in lib/ingest/standards-vocabulary.
+  ///
+  /// Defaults to active, because a register somebody uploaded is a library they
+  /// chose — silently judging nothing would be the worse surprise.
+  ///
+  /// A suspended clause is not judged, does not reach a report and does not
+  /// count toward a run's clause total. Read at the top of the clause query in
+  /// Workers/aidp/stages/analyse.py, which is the one place it takes effect.
+  ///
+  /// **Changed here and nowhere else.** An administrator sets it directly from
+  /// the standards library, and `clause_status_change` records every move. It
+  /// deliberately does *not* go through the decision register: decisions are
+  /// how a new standard is promoted *into* the library, and a standard already
+  /// in the library must never travel back the other way — there is one
+  /// direction, and this is the far end of it.
+  ///
+  /// Per organisation without a join table, because each customer uploads their
+  /// own copy of a register and so owns its clause rows outright.
+  status     String @default("active")
   // For a model-read or restored clause, the source line refs each part came
   // from: { span, heading, statement, rationale,
   // requirements: [{ refs, strength }], guidance, references }.
@@ -687,16 +759,66 @@ model ClauseDraft {
   clauseRef   String @default("")
   clauseTitle String @default("")
 
+  /// What the proposal is asking for. Only "sharpen" is written — see
+  /// DRAFT_KINDS in lib/ingest/standards-vocabulary.
+  ///
+  /// It briefly also carried "adoption", for proposals that a clause be
+  /// accepted into or rejected from the library. That was removed: a standard
+  /// already in the library must never go back to the decision register, and
+  /// whether a clause is in force is now set directly on the clause (see
+  /// Clause.status) and recorded in clause_status_change. The column stays
+  /// because the rows that used it may still be on disk, and because a second
+  /// kind of proposal is a plausible thing to want again.
+  kind String @default("sharpen")
+
+  /// Vestigial, and never written any more: the state an adoption proposal
+  /// asked for. Kept rather than dropped so that no historical row loses what
+  /// it said. Nothing reads it.
+  proposedAdoption String @default("")
+
   /// The reviewed finding that prompted it, and its run. Relation-free for the
   /// same reason as Clause.sourceFindingId.
-  sourceFindingId String
-  sourceRunId     String
+  ///
+  /// Null only on a historical adoption proposal, which was raised from the
+  /// library rather than from a finding. Every proposal written now comes from
+  /// a reviewed finding and carries both.
+  sourceFindingId String?
+  sourceRunId     String?
 
-  /// "drafting" — queued, or a worker is on it
-  /// "ready"    — requirements written and checked, waiting for a person
-  /// "failed"   — the model could not be reached, or wrote nothing usable
-  /// "applied"  — a new clause carries these requirements
+  /// The verdict that finding carried when this was asked for — "partial" or
+  /// "contradicts". Denormalised rather than read back off the finding, for the
+  /// same reason `clauseRef` is: a proposal has to keep stating its own case
+  /// after the finding behind it has been corrected, re-run or removed.
+  ///
+  /// It is also the rule for how this may be published. A `partial` means the
+  /// clause could not be judged as written, so there is one sensible outcome —
+  /// the clause gets sharper. A `contradicts` is different: the design broke a
+  /// rule, and what the breach shows may be that a *second*, separate rule was
+  /// missing rather than that this one was vague. So a contradiction may be
+  /// published either way, and a partial only as a sharpening. See
+  /// `PUBLISH_MODES` in src/lib/ingest/standards.ts.
+  sourceVerdict String @default("")
+
+  /// "drafting"  — queued, or a worker is on it
+  /// "ready"     — requirements written and checked, waiting for a person.
+  ///               This is what the register shows as *pending review*.
+  /// "approved"  — a person has read it and agreed the wording. Not yet in the
+  ///               library: approving and publishing are deliberately two acts.
+  /// "failed"    — the model could not be reached, or wrote nothing usable
+  /// "applied"   — published. A new clause carries these requirements and the
+  ///               old one has been superseded.
   /// "discarded" — a person read it and said no
+  ///
+  /// The gate is `ready -> approved -> applied`, and it is two steps on
+  /// purpose. Approving says the proposed wording is right; publishing changes
+  /// what every future assessment in this organisation measures against. One
+  /// button doing both means the second, irreversible half happens as a side
+  /// effect of agreeing with a sentence — and it lets one person sign off the
+  /// wording while another decides the library is ready to carry it.
+  ///
+  /// The workers only ever write "ready" or "failed", and only act on a row in
+  /// "drafting" (Workers/aidp/standards.py), so nothing downstream of the draft
+  /// can be moved by a worker.
   state String @default("drafting")
 
   /// The requirement lines proposed, in the words a standard would use. Only
@@ -718,8 +840,59 @@ model ClauseDraft {
   /// instead of wondering why one requirement came back.
   setAside Json @default("[]")
 
-  /// The clause the approval created. Null until then.
+  /// The register row this proposal would become, as the worker drafted and
+  /// checked it: `{ identifier, parentIdentifier, category, owner, status,
+  /// title, statement, rationale }`.
+  ///
+  /// Six of this organisation's standards are kept as spreadsheets, and every
+  /// rule in them is a row with those columns. A proposal that carried only
+  /// requirement lines could not be filed back beside them: publishing it as a
+  /// rule of its own meant an approver hand-typing a title and a statement
+  /// with no reference, no category and no owner, and the row landed in the
+  /// library as an orphan. This is that row, drafted.
+  ///
+  /// `identifier` is derived in code, never by the model — "DAT-004a" beside
+  /// "DAT-004", so a reference somebody has already cited in a design or a
+  /// waiver cannot be made to point somewhere else. `status` is always
+  /// "proposed" here; only publishing can make it anything else.
+  ///
+  /// Empty `{}` for a clause parsed from prose rather than a register, and for
+  /// every draft written before this column existed. Read it defensively.
+  entry Json @default("{}")
+
+  /// The clause publishing created. Null until then.
   appliedClauseId String?
+
+  /// How it was published: "sharpen" (the clause gained the lines as a new
+  /// version of itself, superseding the old) or "separate" (a new clause was
+  /// added beside it and the original left standing). Empty until published.
+  ///
+  /// Recorded because the two leave the library in genuinely different states
+  /// and a reader of the register a year later cannot tell which happened by
+  /// looking at the clause — one shows a superseded predecessor, the other
+  /// shows nothing at all.
+  publishMode String @default("")
+
+  /// Who agreed the wording, and when. Set on the move to "approved".
+  ///
+  /// Nullable with a denormalised name beside it, as everywhere else a person
+  /// is recorded in this schema: the register has to keep saying who approved a
+  /// standard after their account is gone, which is exactly what an audit of
+  /// the standards library asks.
+  approvedAt     DateTime?
+  approvedById   String?
+  approvedBy     User?     @relation("ClauseDraftApprover", fields: [approvedById], references: [id], onDelete: SetNull)
+  approvedByName String    @default("")
+
+  /// Who put it into the library, and when. Set on the move to "applied".
+  ///
+  /// Kept separate from the approval above because they are two different acts
+  /// by two possibly different people, and "approved in March, published in
+  /// June" is a real and ordinary sequence that one timestamp cannot express.
+  publishedAt     DateTime?
+  publishedById   String?
+  publishedBy     User?     @relation("ClauseDraftPublisher", fields: [publishedById], references: [id], onDelete: SetNull)
+  publishedByName String    @default("")
 
   requestedById   String?
   requestedBy     User?   @relation(fields: [requestedById], references: [id], onDelete: SetNull)
@@ -733,6 +906,16 @@ model ClauseDraft {
   /// read as two independent proposals agreeing.
   @@index([organisationId, state])
   @@index([clauseId])
+  /// Both support the `SetNull` on the approver and publisher above: without
+  /// them, deleting a user sequentially scans this table once per row removed.
+  ///
+  /// Declared here as well as created in 20261106150000_clause_draft_approval,
+  /// which is the whole point. An index the database holds and the schema does
+  /// not is one `prisma migrate` offers to drop as collateral on the next
+  /// unrelated change — the same trap 20261023120000 had to write a paragraph
+  /// about after three of them went undeclared.
+  @@index([approvedById])
+  @@index([publishedById])
   @@map("clause_draft")
 }
 
@@ -747,6 +930,155 @@ model ClauseDraft {
 // line is or is not a rule, and a disagreement can be traced after the fact.
 // ---------------------------------------------------------------------------
 
+/// One row of a technology stack: a technology this organisation has taken a
+/// position on, and what that position is.
+///
+/// Not a Clause, and deliberately so. A standards register states rules — one
+/// row is one obligation, with a statement a design can breach. A technology
+/// stack states *facts about what is approved*: "Amazon Redshift, Hold,
+/// RA3 / Serverless". There is nothing in a stack row for a design to comply
+/// with, which is why `registers.detect` refuses the stack template rather
+/// than ingesting its rows as standards — see the note there.
+///
+/// It is consulted a different way too. A standards run walks every clause and
+/// asks the model for a verdict. A stack is matched: the technologies a design
+/// names are looked up here, and what is flagged is a name sitting on `hold`,
+/// a name absent from the stack altogether, or a version outside the approved
+/// range. No model is needed to decide any of those.
+model Technology {
+  id String @id @default(cuid())
+
+  organisationId String
+  organisation   Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+
+  /// The stack document this row was read out of. A re-parse replaces the
+  /// rows of that document and nothing else.
+  documentId String
+  document   Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  /// "Amazon Web Services (AWS)". The stack has no identifier column — the
+  /// name is the identity, which is why it is unique per document.
+  name     String
+  category String @default("")
+
+  /// "adopt" | "trial" | "assess" | "hold" — see TECH_STATUSES in
+  /// src/lib/ingest/technology-vocabulary.ts. Stored lower-case; the workbook
+  /// writes them capitalised.
+  ///
+  /// Unlike a standards register's Status column, this one ships populated:
+  /// all 215 rows of the template carry a position. So there is no "unstated"
+  /// here, and an unreadable value is kept as `assess` — the status that
+  /// asserts least.
+  status String @default("assess")
+
+  /// "19c", "8.4 LTS", "N/A (managed)". Free text, because the column is.
+  approvedVersions String @default("")
+  justification    String @default("")
+  /// The stack's "Scenarios in which this needs to be used" column.
+  scenarios        String @default("")
+  owner            String @default("")
+  addedDate        String @default("")
+  lastReviewedDate String @default("")
+  notes            String @default("")
+
+  /// Position in the sheet, so the list reads in the order it was written.
+  ordinal Int
+
+  changes TechnologyChange[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// The name is the identity, so a re-parse updates a row rather than
+  /// duplicating it, and two sheets naming the same technology collapse.
+  @@unique([documentId, name])
+  @@index([organisationId, status])
+  @@map("technology")
+}
+
+/// Every change of a technology's status, kept for good.
+///
+/// Status decides what the next assessment flags: moving something off `hold`
+/// silently stops a breach being reported. A dropdown that changes what the
+/// product will say about future designs, with no record of who changed it or
+/// when, is the kind of gap a compliance tool cannot have — so each edit
+/// appends a row here and nothing ever updates one.
+///
+/// The ingest writes one too, with `byName` empty and `from` blank: the first
+/// position a technology held came from the workbook, and a history that
+/// starts at the first human edit cannot say where the original value came
+/// from.
+model TechnologyChange {
+  id String @id @default(cuid())
+
+  technologyId String
+  technology   Technology @relation(fields: [technologyId], references: [id], onDelete: Cascade)
+
+  /// Empty on the row the ingest writes — there was no previous position.
+  from String @default("")
+  to   String
+
+  /// Null once the user is deleted; the name is kept so the record still reads.
+  byId   String?
+  by     User?   @relation(fields: [byId], references: [id], onDelete: SetNull)
+  byName String  @default("")
+
+  /// "ingested" when the workbook said so, "edited" when a person did.
+  source String @default("edited")
+
+  note String @default("")
+
+  createdAt DateTime @default(now())
+
+  @@index([technologyId, createdAt])
+  @@index([byId])
+  @@map("technology_change")
+}
+
+/// One administrator's change to a clause's standing in the library.
+///
+/// Append-only, and the reason it exists is the same reason the decision
+/// register exists for everything else: suspending a clause changes what every
+/// future assessment measures, and a change of that weight that leaves no trace
+/// is not one anybody can review afterwards.
+///
+/// `clauseId` carries **no relation**, deliberately. A clause dies when its
+/// document is re-parsed or removed, and `ClauseDraft` cascades for exactly
+/// that reason — but a draft describes a proposal about a clause, while this
+/// describes an administrative act by a person, and that act has to outlive the
+/// row it was about. The same argument makes Finding.clauseId a plain string.
+model ClauseStatusChange {
+  id String @id @default(cuid())
+
+  /// Not a foreign key — see the note above.
+  clauseId String
+  /// Denormalised so the record still reads once the clause is gone.
+  clauseRef String @default("")
+
+  organisationId String
+  organisation   Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+
+  from String
+  to   String
+
+  /// Why. Required by the action rather than by the column, because a column
+  /// that permits an empty string is one every caller eventually passes an
+  /// empty string to.
+  reason String @default("")
+
+  /// Null once the user is deleted; the name is kept so the record still reads.
+  byId   String?
+  by     User?   @relation(fields: [byId], references: [id], onDelete: SetNull)
+  byName String  @default("")
+
+  createdAt DateTime @default(now())
+
+  @@index([clauseId, createdAt])
+  @@index([organisationId, createdAt])
+  @@index([byId])
+  @@map("clause_status_change")
+}
+
 model SourceLine {
   id String @id @default(cuid())
 
@@ -754,18 +1086,18 @@ model SourceLine {
   document   Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
 
   // Position in the document from 0 — the number the model saw and answered in.
-  ordinal Int
+  ordinal        Int
   // The same position for people: "L12" is the twelfth paragraph, "T3-r4" the
   // fourth row of the third table, "T3-h" that table's column line.
-  ref     String
+  ref            String
   // "text" | "heading" | "bullet" | "table_header" | "table_row"
-  kind    String
-  page    Int?
-  text    String
+  kind           String
+  page           Int?
+  text           String
   // The section the line falls in, by ordinal, as the parse left it.
   sectionOrdinal Int?
   // Heading depth, when the document declared one.
-  depth   Int?
+  depth          Int?
 
   @@unique([documentId, ordinal])
   @@map("source_line")
@@ -816,7 +1148,7 @@ model LineLabel {
   // "furniture" | "scope" | "reference" | "process_rule" | "guidance" | "other"
   label       String
   // The model's own words for what these lines are.
-  reason      String  @default("")
+  reason      String @default("")
 
   // Set when a reviewer decided these lines are a rule after all.
   restoredAt       DateTime?
@@ -976,8 +1308,8 @@ model Job {
   /// the project rather than one of them; those are found by the run id on
   /// `payload` instead. Every parse, chunk and embed job has one by
   /// construction — they are the stages that read a file.
-  documentId     String?
-  document       Document?    @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  documentId String?
+  document   Document? @relation(fields: [documentId], references: [id], onDelete: Cascade)
 
   // "parse" | "chunk" | "embed" | "analyse"
   stage String
@@ -1135,13 +1467,13 @@ model AssessmentRun {
   ///
   /// Single-design runs snapshot their project's setting too. Historical runs
   /// default to components because that is how they were assessed.
-  designRelationship String @default("components")
+  designRelationship String   @default("components")
   /// Ready design IDs selected when this run was created. Resumes cannot absorb
   /// a later upload or a document that was still indexing when the run began.
-  designIds String[] @default([])
+  designIds          String[] @default([])
   /// IDs present but not ready at run creation, kept separate so later indexing
   /// cannot silently add them to this run's assessed scope.
-  unreadyDesignIds String[] @default([])
+  unreadyDesignIds   String[] @default([])
 
   frameworkId String
   framework   Framework @relation(fields: [frameworkId], references: [id], onDelete: Cascade)
@@ -1161,7 +1493,13 @@ model AssessmentRun {
   // How the judge saw the design. "retrieval": the passages a search found for
   // each clause. "document": the whole document, quoted, with every quote
   // checked word for word against it. See Workers/aidp/whole_document.py.
-  mode           String  @default("retrieval")
+  // "auto" — the default — is the worker choosing between the two rather than a
+  // third way of reading a design. Which one a design can have is a question
+  // about its token count, and nobody pressing "assess" knows that: a single
+  // design is read whole when it fits and searched when it does not, and `note`
+  // says which happened. An explicit "retrieval" is still honoured, and a
+  // project run sets "retrieval" itself. See `_resolve_mode`.
+  mode           String  @default("auto")
   // Anything a reader of these results needs to know about how they were
   // reached — above all, a whole-document run that fell back to search.
   note           String?
@@ -1175,12 +1513,12 @@ model AssessmentRun {
   /// Improvements to the design itself, suggested once the clauses are judged and
   /// the coverage worked out — see Workers/aidp/advice.py. Advice, never a
   /// verdict. Null on runs from before it existed.
-  advice       Json?
+  advice         Json?
   /// Whether the technologies the design names are still supported, looked up on
   /// endoflife.date by product id alone — see Workers/aidp/lifecycle.py. Facts
   /// with a source and a date, never a verdict. Nullable: runs from before this
   /// existed have none.
-  lifecycle    Json?
+  lifecycle      Json?
 
   /// Which of this run's findings come from one fact about the design, worked
   /// out after every clause is judged — see Workers/aidp/rootcause.py and
@@ -1191,7 +1529,7 @@ model AssessmentRun {
   /// clause has to stay answerable as that clause. Twelve contradictions on one
   /// real run came from five facts, and the report counted twelve pieces of
   /// work. Null on runs from before it existed, which read exactly as they did.
-  rootCauses   Json?
+  rootCauses Json?
 
   startedAt   DateTime  @default(now())
   completedAt DateTime?
@@ -1257,7 +1595,7 @@ model Finding {
   /// `unstated` is not a synonym for advisory. It means the standard did not
   /// establish the obligation, and the engine will not establish one on its
   /// behalf — so severity says it needs a person rather than inventing a level.
-  obligation       String @default("unstated")
+  obligation String @default("unstated")
 
   /// Where that obligation came from, weakest claim last: "parsed" (the
   /// standard's own recorded structure), "read" (a modal verb in the clause's
@@ -1275,6 +1613,32 @@ model Finding {
   /// on top of weak retrieval is the failure this exists to catch.
   retrievalScore Float @default(0)
 
+  /// How many independent readings of this clause were taken, and how many of
+  /// them reached the verdict above.
+  ///
+  /// A verdict used to be one model call, and a model does not answer the same
+  /// question the same way twice — two runs over one design came back 9 absent
+  /// and 4 needing review, then 7 and 7. An assessment that moves between
+  /// Tuesday and Thursday is not one an architecture board can be shown, so a
+  /// clause is read several times and the readings are voted on. See `_vote` in
+  /// Workers/aidp/stages/analyse.py, and `coverage.agree`, which has always
+  /// done this for the parts of a design no clause governs.
+  ///
+  /// Readings stop as soon as two agree, so an ordinary clause costs two and
+  /// only a contested one costs three. 1/1 is the single-reading behaviour and
+  /// is what every finding written before this carries.
+  readings Int @default(1)
+  agreed   Int @default(1)
+
+  /// [{ verdict, rationale }] — what the readings that disagreed said.
+  ///
+  /// Kept rather than discarded, for the reason `reviewerVerdict` sits beside
+  /// `verdict` rather than over it: the disagreement is the evaluation data,
+  /// and a vote with its minority thrown away asserts a confidence the run did
+  /// not have. A dissenting "contradicts" under a majority "covered" is the
+  /// most useful line on the page for whoever signs the report off.
+  dissent Json @default("[]")
+
   /// [{ id, title, effect }] — the standing decisions that were in the prompt
   /// and that the model said it applied. Denormalised for the same reason as
   /// `evidence`: a report from last year has to keep explaining itself after
@@ -1287,7 +1651,80 @@ model Finding {
   reviewerNote    String?
   reviewedAt      DateTime?
 
+  /// How strongly the reviewer says the clause binds, where they disagree with
+  /// the engine. Null is the normal state and means the engine's `obligation`
+  /// stands.
+  ///
+  /// This column is the one the obligation note above promises. It says the
+  /// source is stored "so a reviewer can see which kind of answer a severity
+  /// rests on and disagree with the weaker ones" — and until this existed there
+  /// was no way to disagree. A clause written in declarative prose ("All
+  /// external APIs are exposed through Apigee") parses as `unstated`, which
+  /// caps a real breach of it at Check; the reviewer who knows it is mandatory
+  /// can now say so, and the severity follows.
+  ///
+  /// Severity is a function of verdict and obligation, so correcting either
+  /// moves the finding up or down the register, the risk matrix and the route
+  /// the submission takes. See `effectiveFinding` in src/lib/ingest/verdicts.ts,
+  /// which is the only place the engine's answer and the reviewer's are
+  /// resolved into the one a reader is shown.
+  reviewerObligation String?
+
+  /// The severity a reviewer has put on this finding, overriding the derived
+  /// one. "critical" | "moderate" | "check", or null — which is the normal
+  /// state and means it is still worked out from the verdict and the obligation.
+  ///
+  /// Severity is otherwise a pure function of those two, which is right as a
+  /// default and wrong as the only way in. A reviewer who thinks "this one is
+  /// critical" had to reach it sideways by arguing the obligation was mandatory
+  /// — and the obligation is a claim about *what the standard says*, not about
+  /// how much this breach matters. Making one carry the other meant a reviewer
+  /// adjusting priority had to misstate the standard to do it.
+  ///
+  /// It does not touch the verdict, and nothing here will let it. The verdict
+  /// says what the engine found in the design; this says how much it matters.
+  /// A `contradicts` graded Moderate is still a contradiction — the design
+  /// still states something the standard forbids — and it must stay one in the
+  /// register, the export and every count. Severity is a priority, never a
+  /// reclassification, and the two axes stay independent by construction: they
+  /// are different columns and `effectiveFinding` reads them separately.
+  ///
+  /// Only meaningful where the verdict carries a severity at all. On `covered`
+  /// or `not_applicable` there is nothing to act on, so the resolver reports no
+  /// severity whatever this holds — "Covered · Critical" is a row that reads as
+  /// a problem when it is the opposite. The value is kept rather than cleared,
+  /// so a reviewer who moves a finding to covered and back finds their own
+  /// grading still on it.
+  reviewerSeverity String?
+
+  /// The reviewer's own wording of why, where the engine's will not do.
+  ///
+  /// Null means the engine's `rationale` stands, which is the normal state. The
+  /// rationale is not decoration: it is the sentence that reaches the board
+  /// packet and the exported report, so a reviewer who can see it is wrong and
+  /// cannot fix it is signing off prose they disagree with.
+  ///
+  /// Beside the engine's rather than over it, for the same reason
+  /// `reviewerVerdict` sits beside `verdict`: the disagreement is the evaluation
+  /// data, and overwriting the model's answer destroys the only record of how
+  /// well it is actually doing.
+  reviewerRationale String?
+
+  /// Who last edited this finding, and when. Denormalised beside the id, as
+  /// everywhere else a person is recorded here, so the report still attributes
+  /// the correction after their account is gone.
+  ///
+  /// The current position only — every change is appended to `FindingEdit`,
+  /// which is what an audit reads. These three are here so the common question
+  /// ("has anyone touched this, and who?") costs no join.
+  editedAt     DateTime?
+  editedById   String?
+  editedByName String    @default("")
+
   createdAt DateTime @default(now())
+
+  /// Every change a person has made to this finding, newest first.
+  edits FindingEdit[]
 
   @@unique([runId, clauseId, designKey])
   @@index([runId, documentId])
@@ -1298,6 +1735,70 @@ model Finding {
   /// `prisma migrate` would offer to drop on the next unrelated change.
   @@index([runId, obligation], map: "finding_run_obligation_idx")
   @@map("finding")
+}
+
+/// One change a person made to one finding.
+///
+/// Append-only, and the reason this is a table rather than three more columns
+/// on `Finding`. A finding carries its *current* position; this carries how it
+/// got there. "Who changed this verdict from covered to contradicts, when, and
+/// what did they say about it" is the question a governance audit puts to a
+/// compliance tool, and a column that has been overwritten four times cannot
+/// answer it.
+///
+/// It is also the only honest record of disagreement with the engine. An
+/// override is evaluation data — it is the single thing that will ever say how
+/// well the model is doing — and a reviewer who corrects a verdict, thinks
+/// again and corrects it back has produced two data points, not none.
+///
+/// One row per field changed rather than one per save, so "every verdict
+/// corrected in March" is a query rather than a scan through blobs. A save that
+/// touches the verdict and the rationale writes two rows sharing a `batch`.
+model FindingEdit {
+  id String @id @default(cuid())
+
+  findingId String
+  finding   Finding @relation(fields: [findingId], references: [id], onDelete: Cascade)
+
+  /// Ties the rows written by one save together, so the history reads as "M.
+  /// Dexter corrected the verdict and the obligation" rather than as two
+  /// unrelated events a millisecond apart.
+  batch String
+
+  /// Which field moved: "verdict" | "obligation" | "rationale" | "note" |
+  /// "state". A string rather than an enum, for the reason the rest of this
+  /// schema gives: a vocabulary that grows should not cost a migration.
+  field String
+
+  /// The values either side of the change, as text. `before` is null where
+  /// there was nothing there — the first time a reviewer writes a rationale,
+  /// the engine's own wording is what it replaced, and that is recorded rather
+  /// than left to be inferred.
+  ///
+  /// Text rather than Json: every field this records is a short string or a
+  /// paragraph, and a column an auditor can read with `select` beats one that
+  /// needs unwrapping.
+  before String?
+  after  String?
+
+  /// Why, in the reviewer's words. Empty where they gave none — the change is
+  /// still recorded, because an unexplained correction is a fact an audit wants
+  /// and refusing to store it would simply hide it.
+  reason String @default("")
+
+  /// Nullable with a denormalised name beside it, as everywhere else a person
+  /// is recorded in this schema: the history has to keep naming who did this
+  /// after their account is deleted.
+  editedById   String?
+  editedBy     User?   @relation(fields: [editedById], references: [id], onDelete: SetNull)
+  editedByName String  @default("")
+
+  createdAt DateTime @default(now())
+
+  /// The history panel reads one finding newest-first, which is this index.
+  @@index([findingId, createdAt])
+  @@index([editedById])
+  @@map("finding_edit")
 }
 
 /// A ruling the organisation has already made, carried into future assessments.
@@ -1437,7 +1938,7 @@ model SubmissionOutcome {
   documentId String?
 
   /// The project signed off, when the run was over all of its designs.
-  projectId  String?
+  projectId String?
 
   // "approved" | "rejected" | "revise" | "escalated"
   //
@@ -1542,7 +2043,7 @@ model ProviderCredential {
   keyLast4 String
 
   /// Everything a verdict rests on. Strict JSON replies and vision.
-  model String
+  model     String
   /// The high-volume call — one contextual preamble per chunk.
   fastModel String
 
@@ -1552,7 +2053,7 @@ model ProviderCredential {
   openrouterProviders String[] @default([])
   /// OpenRouter only: demand zero-data-retention endpoints. Off by default
   /// because not every model has one.
-  zdr Boolean @default(false)
+  zdr                 Boolean  @default(false)
 
   /// False when the handshake below found the key unable to do the work. The
   /// row is kept rather than discarded so the administrator can see what was
@@ -1589,7 +2090,7 @@ model ProviderCredential {
   /// Who installed it. Null once that account is deleted; the key is the
   /// company's, not theirs, and must not leave with them.
   setById String?
-  setBy   User?  @relation(fields: [setById], references: [id], onDelete: SetNull)
+  setBy   User?   @relation(fields: [setById], references: [id], onDelete: SetNull)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -1647,10 +2148,16 @@ model AiCache {
 // Check and an Architecture Review running in parallel off the same intake
 // data, a combined Review Report, and a Decision.
 //
-// Nothing here is read by the Python workers. They address twenty tables by
-// name and none of these is among them, which is what keeps this layer from
-// being able to change a verdict: it surrounds the engine and never reaches
-// into it. The one place the two meet is `documentId` below.
+// The workers reach two of these tables and no more. A reading of the attached
+// designs (Workers/aidp/request_intake.py) reads `architecture_request` for the
+// project its designs sit in, and writes `intake_reading`. That is the whole of
+// it, and it is deliberately the harmless half: a reading proposes answers a
+// person then accepts, and accepting is what writes the request's own columns.
+//
+// What the workers still cannot touch is everything that decides anything —
+// the significance result, the assignment, the outcome. This layer surrounds
+// the engine and the engine cannot reach back into it to change a verdict or an
+// answer. The other place the two meet is `documentId` below.
 // ---------------------------------------------------------------------------
 
 /// One submission through the ARB workflow.
@@ -1698,6 +2205,12 @@ model ArchitectureRequest {
   documentId String?
 
   /// The diagram, when one was supplied. Relation-free for the same reason.
+  ///
+  /// One of the designs attached to this request, nominated by the requestor —
+  /// nothing infers it. A file being an image does not make it the architecture
+  /// diagram, and the brief hangs a mandatory-field rule on this answer, so it
+  /// is one a person gives rather than one the platform guesses at. See
+  /// `markDiagram` in src/lib/ingest/requests.ts.
   diagramDocumentId String?
 
   /// The assessment this request opened. Relation-free for the same reason.
@@ -1752,8 +2265,8 @@ model ArchitectureRequest {
   /// that actually drives it; this one is prose for the review to read.
   authMechanism String @default("")
 
-  dataStores         String  @default("")
-  dataClassification String  @default("")
+  dataStores             String  @default("")
+  dataClassification     String  @default("")
   newOrDuplicatedStorage Boolean @default(false)
 
   hostingEnvironment String @default("")
@@ -1841,6 +2354,9 @@ model ArchitectureRequest {
 
   significanceResults SignificanceResult[]
   assignments         ReviewAssignment[]
+  /// What the attached designs were read to say, awaiting the requestor's
+  /// confirmation. At most one — see IntakeReading.
+  reading             IntakeReading?
 
   /// One reference per customer. The generator counts this customer's existing
   /// requests, so the constraint is what makes two people filing at the same
@@ -1971,4 +2487,80 @@ model ReviewAssignment {
   @@index([requestId, state])
   @@index([assignedToId, state])
   @@map("review_assignment")
+}
+
+/// What the attached designs say the structured answers are.
+///
+/// The brief's Group C is "mandatory if no diagram; otherwise auto-extracted
+/// from the diagram and shown for confirmation". The second half of that
+/// sentence is this table. A requestor who has attached a design has already
+/// said everything Group C asks for — in prose, in a diagram, in a table — and
+/// asking them to transcribe it into twenty boxes is the data-entry problem the
+/// product exists to remove.
+///
+/// ## Why it is a proposal and never an answer
+///
+/// Nothing here is ever read by the significance check, the renderer or the
+/// report. A reading proposes; a person accepts; accepting writes the ordinary
+/// column on `ArchitectureRequest`, and from that moment the answer is
+/// indistinguishable from a typed one. That is deliberate and it is the whole
+/// safety argument: a classification that decides whether a human reviews a
+/// submission must rest on what a person stated, not on what a model inferred
+/// while nobody was looking.
+///
+/// So this holds inferences, and the request holds answers. `acceptedFields`
+/// records which of the request's answers arrived this way, because "the
+/// requestor typed Confidential" and "the requestor agreed the design said
+/// Confidential" are different claims at a review board.
+///
+/// One per request. A second reading replaces the first rather than
+/// accumulating: the designs have changed, so the earlier inference is about a
+/// submission that no longer exists.
+model IntakeReading {
+  id String @id @default(cuid())
+
+  organisationId String
+  organisation   Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+
+  requestId String              @unique
+  request   ArchitectureRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+
+  /// "reading" | "ready" | "failed"
+  ///
+  /// "reading" is a job on the queue. The wizard polls on it, exactly as the
+  /// document library polls a parse.
+  state String @default("reading")
+
+  /// The proposals, as the worker checked them. One entry per Group C field it
+  /// could answer, each carrying the design's own words:
+  ///
+  ///   [{ field, value, documentId, documentTitle, section, page, quote }]
+  ///
+  /// A field the designs do not answer is absent rather than present-and-empty.
+  /// "The design does not say" is a real answer and the requestor has to give
+  /// it themselves; a blank proposed as though it were read would be the
+  /// inference nobody made.
+  proposals Json @default("[]")
+
+  /// Which fields the requestor accepted. Named rather than counted, so the
+  /// report can say which answers came from the design.
+  acceptedFields String[] @default([])
+
+  /// The designs this reading was made from, as titles. A reading is only
+  /// honest about the submission it read, and a design added afterwards is not
+  /// in it.
+  readDocumentIds String[] @default([])
+
+  /// Which model, for the audit trail, and what went wrong when nothing came.
+  model String?
+  error String?
+
+  requestedById   String?
+  requestedByName String  @default("")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([organisationId, state])
+  @@map("intake_reading")
 }

@@ -6,12 +6,7 @@ import { prisma } from "@/lib/prisma";
 import { NoAccess, requireAccess } from "@/lib/access/gate";
 import { canManageStandards } from "@/lib/access/roles";
 import { NotAMember, requireMembership } from "@/lib/ingest/org";
-import {
-  describeScope,
-  resolveFramework,
-  runJobWhere,
-  supersedeFrameworksFor,
-} from "@/lib/ingest/assessment";
+import { describeScope, resolveFramework, runJobWhere } from "@/lib/ingest/assessment";
 import { promoteFinding } from "@/lib/ingest/decisions";
 import type { DecisionScope } from "@/lib/ingest/decision-effects";
 import { OutcomeRefused, record as recordRunOutcome } from "@/lib/ingest/outcomes";
@@ -19,11 +14,18 @@ import { isOutcome } from "@/lib/ingest/outcomes-vocabulary";
 import {
   NotApplicable,
   NotSharpenable,
+  StatusRefused,
   applyDraft,
+  approveDraft,
   discardDraft,
   requestDraft,
+  setClauseStatus,
+  unapproveDraft,
 } from "@/lib/ingest/standards";
-import { remove } from "@/lib/ingest/storage";
+import { seedStandardLibrary } from "@/lib/ingest/standards-library";
+import { removeDocument } from "@/lib/ingest/documents";
+import { EditRefused, applyEdit, type FindingPatch } from "@/lib/ingest/finding-edits";
+import { EDIT_FIELD_LABEL } from "@/lib/ingest/verdicts";
 import type { Prisma } from "../../../../generated/prisma/client";
 
 export type ActionResult = { ok: boolean; message: string; runId?: string };
@@ -95,18 +97,7 @@ export async function deleteDocument(documentId: string): Promise<ActionResult> 
 
     const document = await prisma.document.findUnique({
       where: { id: documentId },
-      select: {
-        organisationId: true,
-        role: true,
-        storageKey: true,
-        title: true,
-        sections: {
-          select: {
-            _count: { select: { clauses: true } },
-            figures: { select: { storageKey: true } },
-          },
-        },
-      },
+      select: { organisationId: true, role: true },
     });
     if (!document) return { ok: false, message: "That document no longer exists." };
 
@@ -114,20 +105,13 @@ export async function deleteDocument(documentId: string): Promise<ActionResult> 
     const refused = guardStandards(membership, document);
     if (refused) return refused;
 
-    const keys = [
-      document.storageKey,
-      ...document.sections.flatMap((s) => s.figures.map((f) => f.storageKey)),
-    ].filter(Boolean);
-
-    const clauses = document.sections.reduce((n, s) => n + s._count.clauses, 0);
-
-    // Before the delete, while the membership rows still exist to be read: they
-    // cascade away with the document, and a framework version that loses a
-    // standard silently has to stop being the one assessed against.
-    if (document.role !== "assessed") await supersedeFrameworksFor(documentId);
-
-    await prisma.document.delete({ where: { id: documentId } });
-    const removed = await remove(keys);
+    // The mechanics live in lib/ingest/documents so that this action and the
+    // verification script delete the same way. They include retiring the
+    // framework versions that counted this standard, which has to happen
+    // before the row goes — see `removeDocument`.
+    const gone = await removeDocument(documentId);
+    if (!gone) return { ok: false, message: "That document no longer exists." };
+    const { title, clauses, blobsRemoved: removed } = gone;
 
     revalidatePath("/dashboard/documents");
     // A standard is its clauses, so say what stopped being checked rather than
@@ -138,13 +122,13 @@ export async function deleteDocument(documentId: string): Promise<ActionResult> 
       return {
         ok: true,
         message:
-          `Removed "${document.title}". Assessments no longer check its ${clauses} ` +
+          `Removed "${title}". Assessments no longer check its ${clauses} ` +
           `clause${clauses === 1 ? "" : "s"}; reports already written keep theirs.`,
       };
     }
     return {
       ok: true,
-      message: `Deleted "${document.title}" and ${removed} stored file${removed === 1 ? "" : "s"}.`,
+      message: `Deleted "${title}" and ${removed} stored file${removed === 1 ? "" : "s"}.`,
     };
   } catch (error) {
     if (error instanceof NotAMember || error instanceof NoAccess) {
@@ -232,16 +216,27 @@ export async function reprocessDocument(documentId: string): Promise<ActionResul
  * search found for each clause; "document" has it read the whole document and
  * quote it, every quote checked; "both" runs one and then the other, so their
  * verdicts can be compared clause by clause.
+ *
+ * "auto" is the default and is the worker's choice between the first two, not a
+ * third way of reading a design. It reads a single design whole whenever it fits
+ * the token budget and searches when it does not — a decision about the design's
+ * length that nobody pressing this button is in a position to make. Search's
+ * dominant failure is the clause whose answer was on page 23 and did not make a
+ * window of eight passages: the report then says "not addressed" about something
+ * the design plainly addresses, which is the fastest way there is to lose a
+ * reviewer's trust. See `_resolve_mode` in Workers/aidp/stages/analyse.py, which
+ * writes back the mode it actually used, so a run never claims a method that did
+ * not produce it.
  */
 export async function startAssessment(
   documentId: string,
-  mode: "retrieval" | "document" | "both" = "retrieval",
+  mode: "auto" | "retrieval" | "document" | "both" = "auto",
 ): Promise<ActionResult> {
   try {
     const user = await requireUser();
 
     // A Server Action is reachable by direct POST, so the mode is untrusted input.
-    if (!["retrieval", "document", "both"].includes(mode)) {
+    if (!["auto", "retrieval", "document", "both"].includes(mode)) {
       return { ok: false, message: "That is not a way this document can be assessed." };
     }
 
@@ -276,7 +271,10 @@ export async function startAssessment(
     // Reading a design whole needs the page text the parse stage stores. A
     // document processed before that has none and would only fall back to
     // search, so say so before anything is queued.
-    if (mode !== "retrieval") {
+    // Not for "auto", which asked for whichever method fits rather than for this
+    // one: there the fallback to search is the answer, not a refusal, and the
+    // run's note says the document would have to be reprocessed to be read whole.
+    if (mode === "document" || mode === "both") {
       const pages = await prisma.sourceLine.count({ where: { documentId } });
       if (pages === 0) {
         return {
@@ -330,7 +328,7 @@ export async function startAssessment(
           totalClauses: framework.clauseCount,
           // "both" starts with search; the worker opens the whole-document run
           // when this one completes, since a document can have one live run.
-          mode: mode === "document" ? "document" : "retrieval",
+          mode: mode === "document" ? "document" : mode === "both" ? "retrieval" : mode,
         },
         select: { id: true },
       });
@@ -878,15 +876,24 @@ export async function reviewFinding(
     if (!finding) return { ok: false, message: "That finding no longer exists." };
     await requireMembership(user.id, finding.run.organisationId);
 
-    await prisma.finding.update({
-      where: { id: findingId },
-      data: {
-        reviewerState: decision.confirm ? "confirmed" : "overridden",
-        reviewerVerdict: decision.confirm ? null : (decision.verdict ?? null),
-        reviewerNote: decision.note?.trim() || null,
-        reviewedAt: new Date(),
+    // Through the same door as the editor below, rather than writing the
+    // columns here. Two writers of one row is how a history ends up with a
+    // hole exactly where the most common action is: confirming and overriding
+    // are *the* things reviewers do, and a record of corrections that omits
+    // them would be worse than none, because it would look complete.
+    //
+    // `confirm` is the whole difference. Agreeing clears the correction, which
+    // `applyEdit` reads as landing on the engine's answer and records as a
+    // confirmation; disagreeing names the verdict instead.
+    await applyEdit(
+      findingId,
+      { id: user.id, name: user.name || user.email },
+      {
+        verdict: decision.confirm ? null : (decision.verdict ?? null),
+        note: decision.note ?? null,
+        reason: decision.note ?? "",
       },
-    });
+    );
 
     // Promotion runs after the review is durable, and its failure is reported
     // rather than thrown: losing the reviewer's verdict because an embedding
@@ -947,6 +954,103 @@ export async function reviewFinding(
 }
 
 /**
+ * Change what a finding says.
+ *
+ * The verdict, how strongly the clause binds, the rationale and the note — any
+ * of them, on any finding, as many times as a reviewer needs to. Until this
+ * existed a reviewer had exactly one move beyond agreeing: swap the verdict and
+ * leave a note. The rest of what the finding said was the engine's and stayed
+ * the engine's, including the two things that matter most to a reader.
+ *
+ * The *rationale*, because that paragraph is what reaches the board packet and
+ * the exported .docx. A reviewer who can see it is wrong and cannot fix it is
+ * being asked to sign off prose they disagree with.
+ *
+ * The *obligation*, because severity is a function of it. `severityOf` will not
+ * invent an obligation the standard did not state, and enterprise standards are
+ * mostly written in declarative prose, so a real breach of a real rule came out
+ * as "Check — a person has to look". The person who looked can now say what
+ * they found, and the severity, the register's ordering, the risk matrix and
+ * the route the submission takes all follow.
+ *
+ * Nothing the engine wrote is overwritten: every correction lands in a column
+ * beside the original, and every save appends to the finding's history. See
+ * src/lib/ingest/finding-edits.ts, which holds the rules and is the only writer.
+ *
+ * Open to any member, like reviewing has always been. Working the queue is the
+ * work a member is here to do; deciding what then happens to the submission is
+ * the architect's, and that is a different action with its own check.
+ */
+export async function editFinding(
+  findingId: string,
+  patch: FindingPatch,
+): Promise<ActionResult> {
+  try {
+    const user = await requireUser();
+    if (typeof findingId !== "string" || !findingId) {
+      return { ok: false, message: "That finding no longer exists." };
+    }
+
+    const finding = await prisma.finding.findUnique({
+      where: { id: findingId },
+      select: {
+        run: {
+          select: {
+            id: true,
+            organisationId: true,
+            documentId: true,
+            projectId: true,
+            document: { select: { projectId: true } },
+          },
+        },
+      },
+    });
+    if (!finding) return { ok: false, message: "That finding no longer exists." };
+    await requireMembership(user.id, finding.run.organisationId);
+
+    const result = await applyEdit(
+      findingId,
+      { id: user.id, name: user.name || user.email },
+      patch,
+    );
+
+    // Nothing moved. Said plainly rather than reported as a save, so a reviewer
+    // who opened the editor and closed it is not told they changed something.
+    if (result.changed.length === 0 && !result.state) {
+      return { ok: true, message: "No changes to save." };
+    }
+
+    revalidatePath(reportPath(finding.run));
+    revalidatePath("/dashboard/documents");
+    const project = finding.run.projectId ?? finding.run.document?.projectId ?? null;
+    if (project) revalidatePath(`/dashboard/projects/${project}/assessment`);
+
+    // A run opened by an architecture request has its report on the request,
+    // and every severity on that page is derived from these values. Without
+    // this the scorecard, the risk matrix and the sentence saying where the
+    // submission goes next would all keep quoting the uncorrected finding.
+    const request = await prisma.architectureRequest.findFirst({
+      where: { runId: finding.run.id },
+      select: { id: true },
+    });
+    if (request) revalidatePath(`/dashboard/requests/${request.id}/report`);
+
+    const named = result.changed.map((field) => EDIT_FIELD_LABEL[field].toLowerCase());
+    const list =
+      named.length === 1
+        ? named[0]
+        : `${named.slice(0, -1).join(", ")} and ${named[named.length - 1]}`;
+    return { ok: true, message: named.length ? `Saved — ${list} updated.` : "Saved." };
+  } catch (error) {
+    if (error instanceof EditRefused) return { ok: false, message: error.message };
+    if (error instanceof NotAMember || error instanceof NoAccess) {
+      return { ok: false, message: "You do not have access to that finding." };
+    }
+    return { ok: false, message: "Could not save that change." };
+  }
+}
+
+/**
  * Ask for the requirement lines a clause was missing.
  *
  * The reviewer has just confirmed a `partial`, which is the system saying it
@@ -968,13 +1072,16 @@ export async function makeStandard(findingId: string): Promise<ActionResult> {
       select: { run: { select: { documentId: true, projectId: true } } },
     });
     if (finding) revalidatePath(reportPath(finding.run));
+    // It lands in the register as pending, so that page is stale now too.
+    revalidatePath("/dashboard/decisions");
 
     return {
       ok: true,
       message:
         state === "ready"
-          ? "A proposal for this clause is already waiting below."
-          : "Working out the requirement lines this clause was missing. This takes a few seconds.",
+          ? "A proposal for this clause is already waiting in Decisions."
+          : "Drafting the standard this clause was missing. It will appear in Decisions for " +
+            "review in a few seconds.",
     };
   } catch (error) {
     if (error instanceof NotSharpenable) return { ok: false, message: error.message };
@@ -995,6 +1102,10 @@ export async function makeStandard(findingId: string): Promise<ActionResult> {
 export async function applyStandard(
   draftId: string,
   requirements: string[],
+  /** "sharpen" replaces the clause; "separate" adds a new one beside it and
+   *  leaves the original standing. Only a contradiction may ask for the
+   *  second — see PUBLISH_MODES. A separate rule carries its own words. */
+  options: { mode?: string; title?: string; statement?: string; rationale?: string } = {},
 ): Promise<ActionResult> {
   try {
     const user = await requireUser();
@@ -1009,23 +1120,42 @@ export async function applyStandard(
       where: { id: draftId },
       select: { sourceRunId: true, clauseRef: true },
     });
-    const { added } = await applyDraft(user.id, draftId, requirements, user.name || user.email);
+    const { added, mode } = await applyDraft(
+      user.id,
+      draftId,
+      requirements,
+      user.name || user.email,
+      options,
+    );
 
-    const run = draft
+    // A historical adoption proposal carried no run — it was raised against a
+    // clause in the library rather than from a finding — so there may be no
+    // report page to refresh. Every proposal written now has one.
+    const run = draft?.sourceRunId
       ? await prisma.assessmentRun.findUnique({
           where: { id: draft.sourceRunId },
           select: { documentId: true, projectId: true },
         })
       : null;
     if (run) revalidatePath(reportPath(run));
-    // The standard itself changed, so the library pages are stale too.
+    // The standard itself changed, so the library pages are stale too — and so
+    // is the register the proposal was sitting in.
     revalidatePath("/dashboard/documents");
+    revalidatePath("/dashboard/decisions");
 
+    const where = draft?.clauseRef || "the clause";
     return {
       ok: true,
+      // The two outcomes leave the library in genuinely different states, and
+      // the message has to say which happened — a reader who chose "keep both"
+      // and was told the old wording was superseded would reasonably think they
+      // had pressed the wrong thing.
       message:
-        `Added ${added} requirement${added === 1 ? "" : "s"} to ${draft?.clauseRef || "the clause"}. ` +
-        "The earlier wording is kept, and assessments from now on use the new one.",
+        mode === "separate"
+          ? `Published as a new rule beside ${where}, carrying ${added} requirement` +
+            `${added === 1 ? "" : "s"}. The original is unchanged and still judged.`
+          : `Added ${added} requirement${added === 1 ? "" : "s"} to ${where}. ` +
+            "The earlier wording is kept on the record, and assessments from now on use the new one.",
     };
   } catch (error) {
     if (error instanceof NotApplicable) return { ok: false, message: error.message };
@@ -1042,6 +1172,77 @@ export async function applyStandard(
 }
 
 /** Say no to a proposal. Kept rather than deleted — a refusal is worth knowing. */
+/**
+ * Agree the wording of a proposed standard. The first of the register's two
+ * gates — see `approveDraft`, which holds the rule.
+ */
+export async function approveStandard(draftId: string): Promise<ActionResult> {
+  return moveStandard(draftId, "approve");
+}
+
+/** Send an approved proposal back to pending, without refusing it. */
+export async function unapproveStandard(draftId: string): Promise<ActionResult> {
+  return moveStandard(draftId, "unapprove");
+}
+
+/**
+ * The two register moves that change nothing but the state.
+ *
+ * One function because they differ by a verb and a sentence, and because the
+ * paths to revalidate are the same: the register itself, and the report the
+ * proposal came from, which shows the proposal's state beside the finding that
+ * produced it.
+ */
+async function moveStandard(
+  draftId: string,
+  move: "approve" | "unapprove",
+): Promise<ActionResult> {
+  try {
+    const user = await requireUser();
+    if (typeof draftId !== "string" || !draftId) {
+      return { ok: false, message: "That proposal no longer exists." };
+    }
+
+    const draft = await prisma.clauseDraft.findUnique({
+      where: { id: draftId },
+      select: { sourceRunId: true, clauseRef: true },
+    });
+
+    if (move === "approve") {
+      await approveDraft(user.id, draftId, user.name || user.email);
+    } else {
+      await unapproveDraft(user.id, draftId);
+    }
+
+    revalidatePath("/dashboard/decisions");
+    // A historical adoption proposal carried no run — it was raised against a
+    // clause in the library rather than from a finding — so there may be no
+    // report page to refresh. Every proposal written now has one.
+    const run = draft?.sourceRunId
+      ? await prisma.assessmentRun.findUnique({
+          where: { id: draft.sourceRunId },
+          select: { documentId: true, projectId: true },
+        })
+      : null;
+    if (run) revalidatePath(reportPath(run));
+
+    return {
+      ok: true,
+      message:
+        move === "approve"
+          ? `Approved${draft?.clauseRef ? ` for ${draft.clauseRef}` : ""}. It is not in the ` +
+            "standard until you publish it."
+          : "Sent back for review. Nothing has changed in the standard.",
+    };
+  } catch (error) {
+    if (error instanceof NotApplicable) return { ok: false, message: error.message };
+    if (error instanceof NotAMember || error instanceof NoAccess) {
+      return { ok: false, message: "You do not have access to that proposal." };
+    }
+    return { ok: false, message: "Could not change that proposal." };
+  }
+}
+
 export async function discardStandard(draftId: string): Promise<ActionResult> {
   try {
     const user = await requireUser();
@@ -1055,7 +1256,10 @@ export async function discardStandard(draftId: string): Promise<ActionResult> {
     });
     await discardDraft(user.id, draftId);
 
-    const run = draft
+    // A historical adoption proposal carried no run — it was raised against a
+    // clause in the library rather than from a finding — so there may be no
+    // report page to refresh. Every proposal written now has one.
+    const run = draft?.sourceRunId
       ? await prisma.assessmentRun.findUnique({
           where: { id: draft.sourceRunId },
           select: { documentId: true, projectId: true },
@@ -1073,12 +1277,83 @@ export async function discardStandard(draftId: string): Promise<ActionResult> {
   }
 }
 
+
+/**
+ * The document a clause lives in, for revalidation.
+ *
+ * A clause is two joins from its document, and a status change needs the
+ * standard's own page refreshed — it is the page the change was made on, and
+ * the one showing it afterwards.
+ */
+async function standardPathOf(clauseId: string): Promise<string | null> {
+  const clause = await prisma.clause.findUnique({
+    where: { id: clauseId },
+    select: { section: { select: { documentId: true } } },
+  });
+  return clause ? `/dashboard/documents/${clause.section.documentId}` : null;
+}
+
+/**
+ * Whether a write lost a race on a unique constraint.
+ *
+ * Both codes, because the partial index that keeps one live clause per section
+ * ordinal is invisible to Prisma — a race on it arrives as Postgres's own code
+ * rather than as P2002.
+ */
 function isUniqueViolation(error: unknown): boolean {
   if (!error || typeof error !== "object") return false;
   const code = (error as { code?: unknown }).code;
-  // P2002 is Prisma's; 23505 comes straight from Postgres when the constraint
-  // is a partial index Prisma does not know about.
   return code === "P2002" || code === "23505";
+}
+
+/**
+ * Change where a clause stands in the library — active, or suspended.
+ *
+ * Takes effect at once. There is no proposal and no approval gate, and that is
+ * deliberate: the decision register is how a new standard is promoted *into*
+ * the library, and a standard already in it must never travel back the other
+ * way. One direction in, and this is the far end of it.
+ *
+ * Administrator only, enforced in `setClauseStatus` rather than here, and every
+ * move is written to `ClauseStatusChange` with who, when and why.
+ */
+export async function setClauseStatusAction(
+  clauseId: string,
+  status: string,
+  reason: string,
+): Promise<ActionResult> {
+  try {
+    const user = await requireUser();
+    if (typeof clauseId !== "string" || !clauseId) {
+      return { ok: false, message: "That clause is no longer in the library." };
+    }
+
+    const { clauseRef, to } = await setClauseStatus(
+      user.id,
+      clauseId,
+      typeof status === "string" ? status : "",
+      typeof reason === "string" ? reason : "",
+      user.name || user.email,
+    );
+
+    const path = await standardPathOf(clauseId);
+    if (path) revalidatePath(path);
+
+    const named = clauseRef || "That clause";
+    return {
+      ok: true,
+      message:
+        to === "suspended"
+          ? `${named} is suspended. Assessments stop checking it; reports already written keep it.`
+          : `${named} is active again. The next assessment checks it.`,
+    };
+  } catch (error) {
+    if (error instanceof StatusRefused) return { ok: false, message: error.message };
+    if (error instanceof NotAMember || error instanceof NoAccess) {
+      return { ok: false, message: "You do not have access to that clause." };
+    }
+    return { ok: false, message: "Could not change that clause." };
+  }
 }
 
 /**
@@ -1202,5 +1477,75 @@ export async function reviewFigure(
       return { ok: false, message: "You do not have access to that figure." };
     }
     return { ok: false, message: "Could not record that decision." };
+  }
+}
+
+/**
+ * Give this organisation the product's own baseline standards library.
+ *
+ * The answer to an empty Reference Library. Until this existed a new customer
+ * had nothing to be measured against and no way to get anything except an
+ * administrator finding and uploading six files, so the first assessment they
+ * tried refused to start.
+ *
+ * Administrator only, and for the reason `guardStandards` gives rather than a
+ * weaker one: whoever puts reference documents into a workspace decides what
+ * every future assessment in it measures. That this particular set is ours
+ * changes nothing about who may introduce it.
+ *
+ * Safe to press twice. `seedStandardLibrary` goes through `intake.record()`,
+ * which is content-addressed per organisation, so a second press resolves to
+ * the documents already there instead of ingesting them again — and says so,
+ * rather than reporting a success that did nothing.
+ */
+export async function seedLibrary(keys?: string[]): Promise<ActionResult> {
+  try {
+    const access = await requireAccess();
+    if (!canManageStandards(access.role)) {
+      return { ok: false, message: STANDARDS_REFUSED };
+    }
+
+    const wanted = Array.isArray(keys)
+      ? keys.filter((key): key is string => typeof key === "string" && key.length > 0)
+      : undefined;
+
+    const { seeded, present, failed, outcomes } = await seedStandardLibrary({
+      organisationId: access.organisation.id,
+      userId: access.user.id,
+      keys: wanted,
+    });
+
+    revalidatePath("/dashboard/documents");
+    revalidatePath("/dashboard");
+
+    // Reported in full rather than as "done". A register that could not be
+    // read is a deployment fault the administrator cannot fix and must not be
+    // left to discover through a clause count that looks low.
+    if (failed) {
+      const names = outcomes
+        .filter((o) => o.state === "failed")
+        .map((o) => o.title)
+        .join(", ");
+      return {
+        ok: seeded > 0,
+        message:
+          `${seeded} standard${seeded === 1 ? "" : "s"} added, but ${failed} could not be read ` +
+          `(${names}). This is a fault on our side — please tell us.`,
+      };
+    }
+
+    if (!seeded) {
+      return { ok: true, message: "Those standards are already in your library." };
+    }
+
+    return {
+      ok: true,
+      message:
+        `${seeded} standard${seeded === 1 ? "" : "s"} added${present ? `, ${present} already there` : ""}. ` +
+        "They are being read now — each one appears in the library as it finishes.",
+    };
+  } catch (error) {
+    if (error instanceof NoAccess) return { ok: false, message: STANDARDS_REFUSED };
+    return { ok: false, message: "Could not add the standards library." };
   }
 }

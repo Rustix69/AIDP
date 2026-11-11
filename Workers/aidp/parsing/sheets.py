@@ -83,11 +83,22 @@ def _clean(value: Any) -> str | None:
 
     None and empty are the same thing to a reader and must stay distinct from
     "0" or "False", which are values a spreadsheet means.
+
+    Line breaks *inside* a cell are kept, and that is the whole point. A person
+    writing four obligations into one Requirements cell separates them with
+    alt-enter, and that is the only thing saying there are four rather than one
+    — they rarely end in full stops, so a sentence split cannot recover them.
+    Collapsing them here turned a standard's four testable requirements into a
+    single run-on string, which is the same failure the flattened-grid rescue in
+    clauses.py exists to undo, one level earlier. Spaces and tabs within a line
+    are still collapsed, and blank lines dropped, so nothing gains ragged
+    whitespace from this.
     """
     if value is None:
         return None
     if isinstance(value, str):
-        text = " ".join(value.split())
+        lines = [" ".join(part.split()) for part in value.splitlines()]
+        text = "\n".join(line for line in lines if line)
         return text or None
     return str(value)
 

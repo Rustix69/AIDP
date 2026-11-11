@@ -11,6 +11,8 @@ import { readLifecycle } from "@/lib/ingest/lifecycle";
 import { buildRisk } from "@/lib/ingest/risk";
 import { RiskPanel } from "../../../requests/[id]/report/RiskPanel";
 import { listFindings, verdictCounts } from "@/lib/ingest/assessment";
+import { historiesForRun } from "@/lib/ingest/finding-edits";
+import { effectiveFinding } from "@/lib/ingest/verdicts";
 import {
   emptyCounts,
   readEvidence,
@@ -80,6 +82,7 @@ export default async function ProjectAssessmentPage({
     ? (await listFindings(session.user.id, run.id)).filter((f) => f.verdict !== "absent")
     : [];
   const counts: VerdictCounts = run ? await verdictCounts(run.id) : emptyCounts();
+  const histories = run ? await historiesForRun(run.id) : {};
   const promoted = await promotedFrom(
     access.organisation.id,
     findings.map((f) => f.id),
@@ -153,6 +156,10 @@ export default async function ProjectAssessmentPage({
       rationale,
       obligation: readObligation(f.obligation),
       obligationSource: f.obligationSource,
+      // How the readings of this clause voted. See `agreementOf`.
+      readings: f.readings,
+      agreed: f.agreed,
+      dissent: f.dissent,
       evidence: orderEvidence(
         withTables(readEvidence(f.evidence), evidenceTables),
         rationale,
@@ -160,6 +167,11 @@ export default async function ProjectAssessmentPage({
       reviewerState: f.reviewerState,
       reviewerVerdict: f.reviewerVerdict,
       reviewerNote: f.reviewerNote,
+      reviewerObligation: f.reviewerObligation,
+      reviewerSeverity: f.reviewerSeverity,
+      reviewerRationale: f.reviewerRationale,
+      editedByName: f.editedByName,
+      history: histories[f.id] ?? [],
       appliedDecisions: readAppliedDecisions(f.appliedDecisions),
       promotedDecisionId: promoted.get(f.id)?.id ?? null,
       promotedScope: promoted.get(f.id)?.scope ?? null,
@@ -182,7 +194,12 @@ export default async function ProjectAssessmentPage({
         }))
       : [];
   const unreviewed = findings.filter((f) => f.reviewerState === "pending").length;
-  const openFindings = findings.filter((f) => f.verdict === "contradicts").length;
+  // Counted on what each finding says now — a breach a reviewer has overturned
+  // is not an open one, and the header saying otherwise would contradict the
+  // register directly beneath it.
+  const openFindings = findings.filter(
+    (f) => effectiveFinding(f).verdict === "contradicts",
+  ).length;
 
   return (
     <>
@@ -246,6 +263,9 @@ export default async function ProjectAssessmentPage({
                 clauseRef: f.clauseRef,
                 verdict: f.verdict,
                 obligation: f.obligation,
+                reviewerVerdict: f.reviewerVerdict,
+                reviewerObligation: f.reviewerObligation,
+                reviewerSeverity: f.reviewerSeverity,
               })),
               readAdvice(run.advice),
               readLifecycle(run.lifecycle),
@@ -261,7 +281,6 @@ export default async function ProjectAssessmentPage({
         counts={counts}
         findings={findingViews}
         decisionsInForce={decisionsInForce}
-        mayCurate={access.isOwner}
       />
 
       {/* After the findings: the decision is the conclusion drawn from them, and

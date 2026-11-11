@@ -16,7 +16,9 @@
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",
     "db:deploy": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/check-migrate-url.mts && prisma migrate deploy",
-    "db:studio": "prisma studio"
+    "db:studio": "prisma studio",
+    "standards:build": "npx tsx scripts/build-standards-library.mts",
+    "standards:check": "npx tsx scripts/build-standards-library.mts --check"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1101.0",

@@ -10,6 +10,8 @@ import { readRootCauses } from "@/lib/ingest/root-causes";
 import { readAdvice } from "@/lib/ingest/advice";
 import { readLifecycle } from "@/lib/ingest/lifecycle";
 import { latestRun, listFindings, verdictCounts } from "@/lib/ingest/assessment";
+import { historiesForRun } from "@/lib/ingest/finding-edits";
+import { effectiveFinding } from "@/lib/ingest/verdicts";
 import {
   emptyCounts,
   readEvidence,
@@ -26,7 +28,13 @@ import {
 } from "@/lib/ingest/evidence-tables";
 import { readAppliedDecisions } from "@/lib/ingest/decision-effects";
 import { countActive, promotedFrom } from "@/lib/ingest/decisions";
-import { draftView, draftsForRun, requirementsForClauses } from "@/lib/ingest/standards";
+import {
+  draftView,
+  draftsForRun,
+  libraryForDocument,
+  requirementsForClauses,
+} from "@/lib/ingest/standards";
+import { setAside } from "@/lib/ingest/rules";
 import { historyForRun } from "@/lib/ingest/outcomes";
 import { NotAMember, requireMembership } from "@/lib/ingest/org";
 import { canDecideSubmissions, canManageStandards } from "@/lib/access/roles";
@@ -36,6 +44,8 @@ import { Comparison } from "./Comparison";
 import { compareModes } from "@/lib/ingest/comparison";
 import { ClauseYield } from "./ClauseYield";
 import { Understanding } from "./Understanding";
+import { ParsedContent } from "./ParsedContent";
+import { ClauseLibrary } from "./ClauseLibrary";
 import { Decide, type OutcomeView } from "./Decide";
 import { DocumentActions } from "../DocumentActions";
 import { PipelineStatus } from "../PipelineStatus";
@@ -76,9 +86,11 @@ export default async function DocumentPage({
     document.role === "assessed" || canManageStandards(membership.role);
 
   // What the parse made of the document — its sections, tables, figures and the
-  // notes the pipeline raised — is a page of its own; see ./parsed. The count of
-  // things needing a look is worth carrying here, because a reader with no
-  // reason to open that page still has to know there is one.
+  // notes the pipeline raised. For a standard that is the substance of this
+  // page, so it is rendered below; for a design it is the evidence behind the
+  // report and stays on ./parsed, with the count of things needing a look
+  // carried here, because a reader with no reason to open that page still has
+  // to know there is one.
   const toReview = document.issues.filter((i) => i.severity === "high").length;
 
   /**
@@ -99,6 +111,12 @@ export default async function DocumentPage({
   // Where "back", and a delete, take you: designs are reached from the home
   // screen's projects, standards from the library.
   const home = assessed ? "/dashboard" : "/dashboard/documents";
+  // Everything the model decided was not a rule. A standard only; a design has
+  // no rules to set aside.
+  const setAsideView = assessed ? null : await setAside(session.user.id, document.id);
+  // Only for a standard: a design has no clauses, and the query would return an
+  // empty list at the cost of two round trips on every report page.
+  const library = assessed ? [] : await libraryForDocument(session.user.id, document.id);
   const run = assessed ? await latestRun(session.user.id, document.id) : null;
   // A clause the design says nothing about is no longer reported. The report's
   // "Absent" section is the reverse question — the parts of the design no clause
@@ -107,6 +125,10 @@ export default async function DocumentPage({
     ? (await listFindings(session.user.id, run.id)).filter((f) => f.verdict !== "absent")
     : [];
   const counts: VerdictCounts = run ? await verdictCounts(run.id) : emptyCounts();
+  // Every correction made to this run's findings, in one query, carried onto
+  // the rows. The dialog shows a finding's history the moment it opens rather
+  // than fetching it then — see `historiesForRun`.
+  const histories = run ? await historiesForRun(run.id) : {};
 
   // A coverage gap quotes the design to prove the gap is real. Where the design
   // put that proof in a table, the quote is assembled from the section's lines
@@ -170,7 +192,12 @@ export default async function DocumentPage({
         }))
       : [];
   const unreviewed = findings.filter((f) => f.reviewerState === "pending").length;
-  const openFindings = findings.filter((f) => f.verdict === "contradicts").length;
+  // Counted on what each finding says now — a breach a reviewer has overturned
+  // is not an open one, and the header saying otherwise would contradict the
+  // register directly beneath it.
+  const openFindings = findings.filter(
+    (f) => effectiveFinding(f).verdict === "contradicts",
+  ).length;
   const promoted = await promotedFrom(
     document.organisationId,
     findings.map((f) => f.id),
@@ -214,6 +241,10 @@ export default async function DocumentPage({
       rationale,
       obligation: readObligation(f.obligation),
       obligationSource: f.obligationSource,
+      // How the readings of this clause voted. See `agreementOf`.
+      readings: f.readings,
+      agreed: f.agreed,
+      dissent: f.dissent,
       evidence: orderEvidence(
         withTables(readEvidence(f.evidence), evidenceTables),
         rationale,
@@ -221,6 +252,11 @@ export default async function DocumentPage({
       reviewerState: f.reviewerState,
       reviewerVerdict: f.reviewerVerdict,
       reviewerNote: f.reviewerNote,
+      reviewerObligation: f.reviewerObligation,
+      reviewerSeverity: f.reviewerSeverity,
+      reviewerRationale: f.reviewerRationale,
+      editedByName: f.editedByName,
+      history: histories[f.id] ?? [],
       appliedDecisions: readAppliedDecisions(f.appliedDecisions),
       promotedDecisionId: promoted.get(f.id)?.id ?? null,
       promotedScope: promoted.get(f.id)?.scope ?? null,
@@ -277,24 +313,28 @@ export default async function DocumentPage({
         }
         action={
           <>
-            {/* A new tab, not this one: it is looked at beside a finding, to see
-                what the finding was drawn from, and coming back to the report
-                should not mean loading it again. */}
-            <Link
-              href={`/dashboard/documents/${document.id}/parsed`}
-              target="_blank"
-              rel="noreferrer"
-              className="inline-flex items-center gap-1.5 rounded-full border border-line px-3.5 py-1.5 text-[12.5px] text-ink/78 transition-colors hover:border-line-strong hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-royal-mid"
-            >
-              <ScrollText size={13} aria-hidden="true" />
-              Parsed content
-              {toReview > 0 && (
-                <span className="rounded-full border border-warn-line bg-warn-tint px-1.5 text-[11px] text-warn">
-                  {toReview}
-                </span>
-              )}
-              <ExternalLink size={11} aria-hidden="true" className="text-ink/50" />
-            </Link>
+            {/* Only for a design, whose page is its report: the parse is the
+                evidence behind a finding, looked at beside it, so it opens in a
+                new tab and coming back does not mean loading the report again.
+                A standard carries its parse on this page — there is no report
+                for it to crowd, and it is what the reader came for. */}
+            {assessed && (
+              <Link
+                href={`/dashboard/documents/${document.id}/parsed`}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-1.5 rounded-full border border-line px-3.5 py-1.5 text-[12.5px] text-ink/78 transition-colors hover:border-line-strong hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-royal-mid"
+              >
+                <ScrollText size={13} aria-hidden="true" />
+                Parsed content
+                {toReview > 0 && (
+                  <span className="rounded-full border border-warn-line bg-warn-tint px-1.5 text-[11px] text-warn">
+                    {toReview}
+                  </span>
+                )}
+                <ExternalLink size={11} aria-hidden="true" className="text-ink/50" />
+              </Link>
+            )}
 
             {mayChange && (
               <DocumentActions
@@ -341,6 +381,22 @@ export default async function DocumentPage({
         assessed={assessed}
       />
 
+      {/* The rules first, then the parse behind them. A reader opening a
+          standard wants to know what it requires and which of it applies to
+          them; how the pipeline cut the document is the evidence for that
+          list, and it belongs after it rather than in front of it. */}
+      {!assessed && <ClauseLibrary clauses={library} canEdit={mayChange} />}
+
+      {/* A standard is its clauses, so they are on its page rather than behind
+          a link to a second one. */}
+      {!assessed && (
+        <ParsedContent
+          document={document}
+          setAsideView={setAsideView}
+          mayChange={mayChange}
+        />
+      )}
+
       {assessed && (
         <Assessment
           scope={{ kind: "document", documentId: document.id }}
@@ -349,7 +405,6 @@ export default async function DocumentPage({
           counts={counts}
           findings={findingViews}
           decisionsInForce={decisionsInForce}
-          mayCurate={canManageStandards(membership.role)}
         />
       )}
 

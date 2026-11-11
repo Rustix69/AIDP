@@ -100,3 +100,55 @@ function resolvePrismaClient(): PrismaClient {
 }
 
 export const prisma = resolvePrismaClient();
+
+/**
+ * How long a query on the render path may take before the page gives up, in
+ * milliseconds. DB_TIMEOUT_MS overrides it.
+ *
+ * Generous on purpose. A suspended Neon compute takes a second or two to wake
+ * and a cold WebSocket handshake adds to that, so this is not a latency budget
+ * — it is the line past which "slow" has become "never".
+ */
+const DB_TIMEOUT_MS =
+  Number(process.env.DB_TIMEOUT_MS) > 0 ? Number(process.env.DB_TIMEOUT_MS) : 20_000;
+
+/** A query that did not come back. Rendered by the dashboard's error boundary. */
+export class DatabaseUnreachable extends Error {
+  constructor(readonly activity: string) {
+    super(`The database did not respond while ${activity}.`);
+    this.name = "DatabaseUnreachable";
+  }
+}
+
+/**
+ * Fail a render-path query rather than hanging on it forever.
+ *
+ * Neon is reached over a WebSocket, and a WebSocket that stalls — a suspended
+ * compute, a connection pool with nothing left in it, a flaky link — produces
+ * a promise that simply never settles. Nothing above it times out: the server
+ * component stays suspended, so the browser holds the route's `loading.tsx` on
+ * screen and the request stays open, indefinitely. That is the failure this
+ * guards against, and it is indistinguishable to the person from the app being
+ * broken — they reload, each reload opens another stalled request and takes
+ * another connection, and it gets worse rather than better.
+ *
+ * So: after `DB_TIMEOUT_MS` the page fails with something sayable. The query
+ * itself is not cancelled — there is no way to cancel it through the adapter —
+ * but nobody is waiting on it any more.
+ *
+ * For reads on the render path only. Writes must not be abandoned halfway, and
+ * the long-running work (ingestion, assessment) lives in the workers.
+ */
+export async function withDbTimeout<T>(work: Promise<T>, activity: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new DatabaseUnreachable(activity)), DB_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}

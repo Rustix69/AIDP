@@ -1,15 +1,25 @@
-"""Sharpening one clause from one confirmed `partial`, with the checks.
+"""Sharpening one clause from one finding, with the checks.
 
 Every other model call in this system reports on a design. This one writes
 towards the standards library, so it is the only place a model's words can end
 up binding future assessments — and it is bounded accordingly.
 
-What a `partial` actually means is that the clause could not be judged. "Ensure
-resilience" against a design that retries without a dead-letter path is partial
-for ever: the design does some of it, the clause never said what the rest was,
-and the next design gets the same useless verdict. A reviewer who has just
-confirmed that verdict knows what the clause meant. This turns that knowledge
-into requirement lines.
+Drafted from a `partial` or a `contradicts`, which are the two verdicts that say
+something about the *wording* of the clause rather than about the design.
+
+A `partial` means the clause could not be judged. "Ensure resilience" against a
+design that retries without a dead-letter path is partial for ever: the design
+does some of it, the clause never said what the rest was, and the next design
+gets the same useless verdict.
+
+A `contradicts` on a vague clause is the same fault wearing a worse face. The
+design states something the standard forbids, but the standard never said in
+what terms — so the breach is arguable, and the next submission will argue it
+again. The reviewer who has just read it is the person best placed to write the
+rule that would have settled it.
+
+Either way the reviewer knows what the clause meant, and this turns that
+knowledge into requirement lines.
 
 The model may add requirement lines and do nothing else. It does not rewrite the
 statement, does not touch the rationale, and decides nothing — a person approves
@@ -58,6 +68,19 @@ MAX_CHARS = 240
 MIN_WORDS = 6
 
 MAX_NOTE = 200
+
+# The register's own columns. A title longer than this is a sentence wearing a
+# title's place, and a statement longer than this is the requirement lines
+# written twice — both are the shapes that make a register unreadable at the
+# width it is actually read at.
+MAX_ENTRY_TITLE = 80
+MAX_ENTRY_STATEMENT = 400
+MAX_ENTRY_RATIONALE = 240
+
+# What a rule drafted here is marked as until somebody publishes it. The
+# registers use "adopted" for what binds; nothing a model wrote may wear that
+# word before a person has agreed to it.
+PROPOSED_STATUS = "proposed"
 
 # What makes a line a rule rather than a remark. Checked rather than trusted:
 # the prompt asks for "must", and a model that drifts into "should consider"
@@ -114,9 +137,47 @@ class Drafted:
     model: str | None = None
     error: str | None = None
     set_aside: list[dict] = field(default_factory=list)
+    # The register row this proposal would become: identity carried over from
+    # the clause, prose written by the model and checked below. Empty for a
+    # clause that came from prose rather than a register — see `register_of`.
+    entry: dict = field(default_factory=dict)
 
     def refuse(self, text: str, reason: str) -> None:
         self.set_aside.append({"text": text[:MAX_CHARS], "reason": reason})
+
+
+def register_of(clause: dict) -> dict:
+    """The register row this clause came from, if it came from one.
+
+    Six of this organisation's standards are kept as spreadsheets rather than
+    prose, and `parsing/registers.py` files each row's identity under
+    `sourceRefs.register`: its reference, the category it sits in, who owns it
+    and whether it is adopted. None of that is in the clause's own columns, so
+    a sharpening that reads only the clause writes a proposal that cannot be
+    filed back beside the rows it came from.
+
+    Read defensively: `sourceRefs` is free JSON written by the parser, and a
+    clause parsed from a Word document has no register block at all.
+    """
+    refs = clause.get("sourceRefs")
+    if not isinstance(refs, dict):
+        return {}
+    block = refs.get("register")
+    # A sharpened clause keeps its register block in place (see applyDraft), but
+    # an older one, published before that was true, carries it one level down
+    # under "inherited". Both are read, so a second sharpening of a rule that
+    # has already been sharpened once still knows which row it belongs to.
+    if not isinstance(block, dict):
+        inherited = refs.get("inherited")
+        block = inherited.get("register") if isinstance(inherited, dict) else None
+    if not isinstance(block, dict):
+        return {}
+    return {
+        "identifier": str(block.get("id") or "").strip(),
+        "category": str(block.get("category") or "").strip(),
+        "owner": str(block.get("owner") or "").strip(),
+        "status": str(block.get("status") or "").strip(),
+    }
 
 
 def render_clause(clause: dict) -> str:
@@ -127,6 +188,15 @@ def render_clause(clause: dict) -> str:
     a fourth that restates the second.
     """
     lines = [f"Reference: {clause.get('clauseRef') or '(unnumbered)'}"]
+    register = register_of(clause)
+    if register.get("category"):
+        # Shown so rule 9 has a voice to write in. A category is the strongest
+        # signal in the register of how its rows are phrased — the other rules
+        # under "Data Architecture" are the ones this proposal will be read
+        # beside.
+        lines.append(f"Category: {register['category']}")
+    if register.get("owner"):
+        lines.append(f"Owned by: {register['owner']}")
     if clause.get("title"):
         lines.append(f"Title: {clause['title']}")
     if clause.get("statement"):
@@ -150,10 +220,26 @@ def render_clause(clause: dict) -> str:
     return "\n".join(lines)
 
 
+# How far a person has gone with the finding, in words the model can weigh.
+# Said rather than assumed: a draft may now be asked for from a finding nobody
+# has adjudicated yet, and telling the model a verdict was "confirmed by a
+# reviewer" when it was not is putting a false warrant in front of the one call
+# in this system whose output can end up binding future assessments.
+_REVIEW_STANDING = {
+    "confirmed": "a reviewer has read this and agreed with it",
+    "pending": "nobody has reviewed this yet — weigh it on the evidence below alone",
+}
+
+
 def render_finding(finding: dict) -> str:
     """The verdict and the reason it was reached, as the case for sharpening."""
+    verdict = finding.get("verdict") or "partial"
+    standing = _REVIEW_STANDING.get(
+        finding.get("reviewerState") or "pending",
+        "nobody has reviewed this yet — weigh it on the evidence below alone",
+    )
     lines = [
-        f"Verdict: {finding.get('verdict') or 'partial'} (confirmed by a reviewer)",
+        f"Verdict: {verdict} ({standing})",
         f"Reason given: {finding.get('rationale') or '(none recorded)'}",
     ]
     if finding.get("reviewerNote"):
@@ -238,12 +324,87 @@ def _proper_names(evidence: list[dict]) -> set[str]:
     return names
 
 
+def _entry_of(
+    reply: dict,
+    *,
+    clause: dict,
+    identity: dict,
+    design: str,
+    names: set[str],
+    out: Drafted,
+) -> dict:
+    """The register row the model drafted, checked column by column.
+
+    Why this is checked at all, when a person approves every word before it
+    binds: the same reason the requirement lines are. An approver reading a
+    row that looks like the hundred and sixty-nine beside it is reading for
+    sense, not auditing it for a vendor name — the plausible row is the one
+    that gets waved through. So the statement passes exactly the floor a
+    requirement line passes, and a column that fails is dropped rather than
+    shown, because an empty column asks to be filled and a bad one does not.
+
+    Identity — the reference, the category, the owner — is never taken from the
+    reply. It is carried from the clause by `record`, so a model cannot invent
+    a reference that collides with a row somebody else owns.
+    """
+    raw = reply.get("entry")
+    if not isinstance(raw, dict):
+        raw = {}
+
+    entry = dict(identity)
+
+    title = " ".join(str(raw.get("title") or "").split())
+    if title:
+        if len(title) > MAX_ENTRY_TITLE:
+            out.refuse(title, "title too long for the register")
+        elif [name for name in names if name in title]:
+            out.refuse(title, "title names the design itself")
+        else:
+            entry["title"] = title
+
+    statement = " ".join(str(raw.get("statement") or "").split())
+    if statement:
+        plain = _words(statement)
+        named = sorted((name for name in names if name in statement), key=len, reverse=True)
+        if len(statement) > MAX_ENTRY_STATEMENT:
+            out.refuse(statement, "statement longer than a register row carries")
+        elif not _NORMATIVE.search(statement):
+            out.refuse(statement, "statement not written as a rule")
+        elif _VAGUE.search(statement):
+            out.refuse(statement, "statement a design could not be failed on")
+        elif plain and plain in design:
+            out.refuse(statement, "statement copied from the design")
+        elif named:
+            out.refuse(statement, f"statement names the design itself ({named[0]})")
+        else:
+            entry["statement"] = statement
+
+    rationale = " ".join(str(raw.get("rationale") or "").split())
+    if rationale:
+        if len(rationale) > MAX_ENTRY_RATIONALE:
+            out.refuse(rationale, "rationale longer than a register row carries")
+        elif [name for name in names if name in rationale]:
+            out.refuse(rationale, "rationale names the design itself")
+        else:
+            entry["rationale"] = rationale
+
+    # Nothing survived and nothing was carried in: say so with an empty dict
+    # rather than a row of blank columns, which the register screen would draw
+    # as a rule that states nothing.
+    return entry if any(entry.get(key) for key in entry) else {}
+
+
 def check(
     reply: dict,
     *,
     clause: dict,
     evidence: list[dict],
     model: str | None = None,
+    # The register columns that are facts rather than drafting decisions, as
+    # `record` reads them off the clause. Defaulted so the pure tests, and any
+    # clause that never came from a register, still call this with three
+    # arguments.
+    identity: dict | None = None,
 ) -> Drafted:
     """One reply, checked line by line into a draft a person can be shown.
 
@@ -313,6 +474,14 @@ def check(
 
     out.requirements = kept
     out.note = " ".join(str(reply.get("note") or "").split())[:MAX_NOTE]
+    out.entry = _entry_of(
+        reply,
+        clause=clause,
+        identity=identity if identity is not None else {},
+        design=design,
+        names=names,
+        out=out,
+    )
 
     if not kept:
         # Not a failure. "This clause is already specific enough" is a real and
@@ -330,14 +499,56 @@ def check(
 
 _CLAUSE = """
 SELECT cl."id", cl."title", cl."statement", cl."rationale", cl."requirements",
-       cl."guidance", cl."supersededById",
-       s."numberText", s."headingPath",
+       cl."guidance", cl."supersededById", cl."sourceRefs",
+       s."numberText", s."headingPath", s."documentId",
        d."title" AS "documentTitle"
   FROM "clause" cl
   JOIN "document_section" s ON s."id" = cl."sectionId"
   JOIN "document" d ON d."id" = s."documentId"
  WHERE cl."id" = %s
 """
+
+# Every reference already used in this standard, so a proposed one can avoid
+# them. Scoped to the document rather than the organisation: two registers may
+# legitimately both carry a "SEC-001", and they are different books.
+_TAKEN_REFS = """
+SELECT DISTINCT "numberText"
+  FROM "document_section"
+ WHERE "documentId" = %s AND "numberText" <> ''
+"""
+
+# "DAT-004" → ("DAT-004", ""), "DAT-004a" → ("DAT-004", "a"). The suffix is how
+# a register writes a rule added beside an existing one without renumbering
+# every row beneath it, which is why this derives one rather than taking the
+# next free number in the category.
+_SUFFIXED = re.compile(r"^(.*?)([a-z]*)$")
+
+
+def next_reference(parent: str, taken: set[str]) -> str:
+    """The reference a rule published *beside* `parent` would carry.
+
+    Suffixed rather than numbered. A register is read by people who have cited
+    its rows elsewhere — in a design, in a waiver, in a review minute — so
+    inserting "DAT-005" between DAT-004 and the real DAT-005 would silently
+    change what every one of those citations points at. "DAT-004a" cannot
+    collide with anything already written down, and it says what it is: a rule
+    that grew out of DAT-004.
+
+    Returns "" for a parent that has no reference of its own, which is a clause
+    from a prose standard. Those are not register rows and must not be given a
+    reference that implies they are.
+    """
+    base = (parent or "").strip()
+    if not base:
+        return ""
+    stem = _SUFFIXED.match(base).group(1) or base
+    for code in range(ord("a"), ord("z") + 1):
+        candidate = f"{stem}{chr(code)}"
+        if candidate not in taken:
+            return candidate
+    # Twenty-six rules hung off one row is a register that needs a person, not
+    # a twenty-seventh suffix.
+    return ""
 
 _FINDING = """
 SELECT "id", "verdict", "rationale", "evidence", "reviewerState", "reviewerVerdict",
@@ -365,6 +576,12 @@ def record(draft_id: str) -> dict:
             raise RuntimeError(f"clause draft {draft_id} no longer exists")
         clause = db.one(conn, _CLAUSE, (draft["clauseId"],))
         finding = db.one(conn, _FINDING, (draft["sourceFindingId"],))
+        taken: set[str] = set()
+        if clause is not None:
+            taken = {
+                str(row["numberText"]).strip()
+                for row in db.query(conn, _TAKEN_REFS, (clause["documentId"],))
+            }
 
     if draft["state"] != "drafting":
         # Discarded, or already applied, while the job waited for a worker.
@@ -399,6 +616,23 @@ def record(draft_id: str) -> dict:
             ),
         )
 
+    # The columns a model is not allowed to choose. `status` is pinned to
+    # "proposed" rather than copied: the row this came from says "adopted",
+    # and a draft inheriting that word would read as policy on the screen
+    # where somebody is still deciding whether it should be.
+    register = register_of(clause)
+    identity = (
+        {
+            "identifier": next_reference(register.get("identifier") or clause["clauseRef"], taken),
+            "parentIdentifier": register.get("identifier") or clause["clauseRef"],
+            "category": register.get("category", ""),
+            "owner": register.get("owner", ""),
+            "status": PROPOSED_STATUS,
+        }
+        if register
+        else {}
+    )
+
     try:
         reply = llm.sharpen_clause(
             clause=render_clause(clause),
@@ -409,7 +643,13 @@ def record(draft_id: str) -> dict:
         logs.warn(log, "sharpening call failed", draftId=draft_id, error=str(exc)[:200])
         return _store(draft_id, Drafted(state="failed", error=str(exc)[:400]))
 
-    drafted = check(reply, clause=clause, evidence=evidence, model=llm.model_name()[1])
+    drafted = check(
+        reply,
+        clause=clause,
+        evidence=evidence,
+        model=llm.model_name()[1],
+        identity=identity,
+    )
     return _store(draft_id, drafted)
 
 
@@ -427,6 +667,7 @@ def _store(draft_id: str, drafted: Drafted) -> dict:
                    "model" = %s,
                    "error" = %s,
                    "setAside" = %s,
+                   "entry" = %s,
                    "updatedAt" = now()
              WHERE "id" = %s
             """,
@@ -437,6 +678,7 @@ def _store(draft_id: str, drafted: Drafted) -> dict:
                 drafted.model,
                 drafted.error,
                 Jsonb(drafted.set_aside),
+                Jsonb(drafted.entry),
                 draft_id,
             ),
         )
@@ -453,5 +695,6 @@ def _store(draft_id: str, drafted: Drafted) -> dict:
         "requirements": drafted.requirements,
         "note": drafted.note,
         "setAside": drafted.set_aside,
+        "entry": drafted.entry,
         "error": drafted.error,
     }

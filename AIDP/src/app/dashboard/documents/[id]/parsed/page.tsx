@@ -2,16 +2,11 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { headers } from "next/headers";
 import { notFound, redirect } from "next/navigation";
-import { AlertTriangle, ArrowLeft, Info } from "lucide-react";
+import { ArrowLeft } from "lucide-react";
 import { auth } from "@/lib/auth";
-import { cn } from "@/lib/cn";
-import { getDocument, isTerminal, STATUS_LABEL } from "@/lib/ingest/documents";
-import { NotAMember, requireMembership } from "@/lib/ingest/org";
-import { canManageStandards } from "@/lib/access/roles";
-import { setAside } from "@/lib/ingest/rules";
-import { Figures, type FigureView } from "../Figures";
-import { SetAside } from "../SetAside";
-import { SectionRow } from "./SectionRow";
+import { getDocument, STATUS_LABEL } from "@/lib/ingest/documents";
+import { NotAMember } from "@/lib/ingest/org";
+import { ParsedContent } from "../ParsedContent";
 import { PageHeader } from "@/components/ui/PageHeader";
 
 export const dynamic = "force-dynamic";
@@ -22,7 +17,7 @@ export const metadata: Metadata = {
 };
 
 /**
- * What the pipeline made of a document, on a page of its own.
+ * What the pipeline made of a submitted design, on a page of its own.
  *
  * All of this used to sit under the report, where it pushed the findings down a
  * screen and answered a question nobody had asked yet. It is the evidence
@@ -30,6 +25,11 @@ export const metadata: Metadata = {
  * they were cut, what came out as a table or a figure, and what the parse itself
  * flagged. A reviewer wants it when a finding looks wrong, and never otherwise —
  * so the report links to it, in its own tab, and stays about the assessment.
+ *
+ * A reference standard is the other way round: there is no report to keep this
+ * out of, the parse is the standard, and so it is shown on the standard's own
+ * page. This address is kept working for anyone who bookmarked it, and sends
+ * them there.
  *
  * The same access check as the report. A document in someone else's
  * organisation is indistinguishable from one that does not exist.
@@ -53,32 +53,9 @@ export default async function ParsedPage({
   }
   if (!document) notFound();
 
-  const membership = await requireMembership(session.user.id, document.organisationId);
-  const mayChange = document.role === "assessed" || canManageStandards(membership.role);
-
-  const clauses = document.sections.reduce((n, s) => n + s.clauses.length, 0);
-  const tables = document.sections.reduce((n, s) => n + s.tables.length, 0);
-  const setAsideView =
-    document.role === "reference" ? await setAside(session.user.id, document.id) : null;
-  const figureViews: FigureView[] = document.sections
-    .flatMap((s) =>
-      s.figures.map((f) => ({
-        id: f.id,
-        page: f.page,
-        caption: f.caption,
-        description: f.description,
-        correctedDescription: f.correctedDescription,
-        reviewState: f.reviewState,
-        complexity: f.complexity,
-        headingPath: s.headingPath,
-      })),
-    )
-    // In the document's own order, page by page, as a reader turning through it
-    // would meet them. Within a page the order they were read in holds: the sort
-    // is stable, and sections and their figures arrive in reading order.
-    .sort((a, b) => a.page - b.page);
-  const high = document.issues.filter((i) => i.severity === "high");
-  const other = document.issues.filter((i) => i.severity !== "high");
+  // A standard carries its parse on its own page now. Called outside the
+  // try/catch above on purpose: `redirect` works by throwing.
+  if (document.role !== "assessed") redirect(`/dashboard/documents/${document.id}`);
 
   return (
     <>
@@ -102,128 +79,10 @@ export default async function ParsedPage({
         }
       />
 
-      {!isTerminal(document.status) && (
-        <p className="mb-6 rounded-xl border border-line bg-card px-4 py-3 text-[13px] text-ink/70">
-          This document is still being read, so what follows is as far as the pipeline has got.
-        </p>
-      )}
-
-      <dl className="mb-8 grid grid-cols-2 gap-3 sm:grid-cols-4">
-        <Stat label="Sections" value={document.sections.length} />
-        <Stat label="Clauses" value={clauses} />
-        <Stat label="Tables" value={tables} />
-        <Stat label="Chunks" value={document._count.chunks} />
-      </dl>
-
-      {/*
-        Issues come before content on purpose. An empty section or a table that
-        extracted at low confidence is the single most useful thing this page
-        can tell a reviewer, and burying it under an outline is how a document
-        with a hole in it gets treated as complete.
-      */}
-      {document.issues.length > 0 && (
-        <section className="mb-9">
-          <h2 className="mb-3 font-display text-[17px] font-semibold tracking-[-0.01em] text-ink">
-            Review
-          </h2>
-          <ul className="space-y-2">
-            {[...high, ...other].map((issue) => (
-              <li
-                key={issue.id}
-                className={cn(
-                  "flex gap-3 rounded-xl border px-4 py-3",
-                  issue.severity === "high"
-                    ? "border-warn-line bg-warn-tint"
-                    : "border-line bg-card",
-                )}
-              >
-                <span
-                  className={cn(
-                    "mt-0.5 shrink-0",
-                    issue.severity === "high" ? "text-warn" : "text-ink/62",
-                  )}
-                >
-                  {issue.severity === "high" ? <AlertTriangle size={15} /> : <Info size={15} />}
-                </span>
-                <span className="min-w-0">
-                  <span className="block text-[13.5px] leading-relaxed text-ink/84">
-                    {issue.detail}
-                  </span>
-                  <span className="mt-0.5 block text-[11.5px] text-ink/62">
-                    {issue.kind.replace(/_/g, " ")}
-                    {issue.page != null && ` · page ${issue.page}`}
-                  </span>
-                </span>
-              </li>
-            ))}
-          </ul>
-        </section>
-      )}
-
-      {/* After the review notes, which point into it, and before the outline:
-          a rule wrongly set aside is invisible everywhere else. */}
-      {setAsideView && <SetAside view={setAsideView} editable={mayChange} />}
-
-      <Figures figures={figureViews} />
-
-      <section>
-        <h2 className="mb-1 font-display text-[17px] font-semibold tracking-[-0.01em] text-ink">
-          Structure
-        </h2>
-        {/* The counts were the whole of this list, and a count cannot tell a
-            good parse from a bad one. Say that a row opens: a drop target is
-            discoverable by people who already know, and by nobody else. */}
-        <p className="mb-3 text-[12.5px] text-ink/64">
-          Open a section to see exactly what was taken out of it — the lines as they were
-          read off the page, the clauses, and the tables.
-        </p>
-
-        {document.sections.length === 0 ? (
-          <p className="rounded-xl border border-line bg-card px-5 py-8 text-center text-[13.5px] text-ink/64">
-            {isTerminal(document.status)
-              ? "No sections were detected in this document."
-              : "Still reading the document…"}
-          </p>
-        ) : (
-          /*
-            A tree, not a stack of cards. Thirty sections rendered as identical
-            full-width bars gives no sense of depth and no way to skim — the
-            hierarchy is the most useful thing this outline carries, so it is
-            drawn: parents sit at the margin with weight, children hang off a
-            rule, and only the counts that exist are shown.
-          */
-          <ol className="border-t border-line">
-            {document.sections.map((section) => (
-              <SectionRow
-                key={section.id}
-                documentId={document.id}
-                section={{
-                  id: section.id,
-                  depth: section.depth,
-                  numberText: section.numberText,
-                  title: section.title,
-                  pageStart: section.pageStart,
-                  isEmpty: section.isEmpty,
-                  clauses: section.clauses.length,
-                  tables: section.tables.length,
-                  figures: section.figures.length,
-                }}
-              />
-            ))}
-          </ol>
-        )}
-      </section>
+      {/* A design, so nothing is set aside: set-aside ranges are a standard's
+          rules that were judged not to be rules, and a standard never reaches
+          this page. */}
+      <ParsedContent document={document} setAsideView={null} mayChange />
     </>
-  );
-}
-
-function Stat({ label, value }: { label: string; value: number }) {
-  return (
-    <div className="rounded-xl border border-line bg-card px-4 py-3">
-      <dt className="text-[11.5px] uppercase tracking-[0.1em] text-ink/62">{label}</dt>
-      <dd className="mt-1 font-display text-[22px] font-semibold tracking-[-0.02em] text-ink">
-        {value}
-      </dd>
-    </div>
   );
 }

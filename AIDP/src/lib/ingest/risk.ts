@@ -1,10 +1,8 @@
 import { CATEGORY_LABEL, type AdviceCategory, type AdviceView } from "./advice";
 import type { LifecycleView } from "./lifecycle";
 import {
-  briefSeverityOf,
-  readObligation,
+  effectiveFinding,
   type BriefSeverity,
-  type Obligation,
 } from "./verdicts";
 
 /**
@@ -138,6 +136,13 @@ export type RiskFinding = {
   clauseRef: string;
   verdict: string;
   obligation: unknown;
+  /** A reviewer's corrections, where they made any. The matrix weighs what the
+   *  finding says now — a breach somebody has overturned is not a risk, and one
+   *  whose obligation a reviewer has established as mandatory is a worse one
+   *  than the engine could prove. */
+  reviewerVerdict?: string | null;
+  reviewerObligation?: string | null;
+  reviewerSeverity?: string | null;
 };
 
 export function buildRisk(
@@ -147,8 +152,7 @@ export function buildRisk(
 ): RiskView {
   const graded = new Map<string, { severity: BriefSeverity; settled: boolean }>();
   for (const finding of findings) {
-    const obligation: Obligation = readObligation(finding.obligation);
-    const grade = briefSeverityOf(finding.verdict, obligation);
+    const grade = effectiveFinding(finding).brief;
     // Null for a covered or inapplicable clause: nothing to act on, so nothing
     // to weigh. The same reasoning `severityOf` gives.
     if (!grade) continue;

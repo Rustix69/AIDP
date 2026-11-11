@@ -4,6 +4,7 @@ import { useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import { ArrowUpRight, Ban, Check, Gavel, RefreshCw } from "lucide-react";
 import { cn } from "@/lib/cn";
+import { Pill } from "@/components/ui/Pill";
 import {
   OUTCOMES,
   OUTCOME_META,
@@ -21,12 +22,14 @@ export type OutcomeView = {
   snapshot: OutcomeSnapshot | null;
 };
 
-const TONE: Record<string, string> = {
-  good: "border-ok-line bg-ok-tint text-ok",
-  bad: "border-danger-line bg-danger-tint text-danger",
-  warn: "border-warn-line bg-warn-tint text-warn",
-  escalate: "border-royal-mid/40 bg-royal/8 text-royal",
-};
+/** The recorded outcome, as a pill on the history entry. Named by meaning so
+ *  a decision reads the same here as its state does anywhere else. */
+const HISTORY_TONE = {
+  good: "ok",
+  bad: "critical",
+  warn: "warn",
+  escalate: "accent",
+} as const;
 
 const ICON = {
   approved: Check,
@@ -34,6 +37,26 @@ const ICON = {
   revise: RefreshCw,
   escalated: ArrowUpRight,
 } as const;
+
+/**
+ * The four outcomes as buttons rather than as chips.
+ *
+ * The client's prototype puts the decision at the bottom of the report as
+ * three weighted controls — approve filled, the rest outlined — because that
+ * is what the screen is *for*. As a row of equally quiet tinted chips the
+ * decision read as a filter on the findings above it, and people went looking
+ * for a submit button that was already there.
+ *
+ * Only approval is filled. Filling all four would make the loudest thing on
+ * the page a choice between four loud things, and rejecting or escalating a
+ * submission is not an action to invite by weight.
+ */
+const ACTION: Record<string, string> = {
+  good: "border-ok bg-ok text-white hover:bg-ok/90",
+  bad: "border-danger bg-card text-danger hover:bg-danger-tint",
+  warn: "border-warn bg-card text-warn hover:bg-warn-tint",
+  escalate: "border-royal bg-card text-royal hover:bg-royal-tint",
+};
 
 /**
  * What the reason box asks for, which is a different question each time.
@@ -128,15 +151,14 @@ export function Decide({
                 )}
               >
                 <div className="flex flex-wrap items-center gap-2.5">
-                  <span
-                    className={cn(
-                      "inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-[11.5px]",
-                      TONE[entryMeta.tone],
-                    )}
+                  <Pill
+                    tone={
+                      HISTORY_TONE[entryMeta.tone as keyof typeof HISTORY_TONE] ?? "neutral"
+                    }
+                    icon={<Icon size={11} />}
                   >
-                    <Icon size={11} />
                     {entryMeta.label}
-                  </span>
+                  </Pill>
                   <span className="text-[12.5px] text-ink/66">
                     {entry.decidedByName || "Unattributed"} ·{" "}
                     {new Date(entry.createdAt).toLocaleDateString(undefined, {
@@ -175,99 +197,124 @@ export function Decide({
         </ol>
       )}
 
-      {(unreviewed > 0 || open > 0) && !chosen && (
-        <p className="mb-3 text-[12.5px] text-warn">
-          {open > 0 && `${open} finding${open === 1 ? "" : "s"} still contradict the standards`}
-          {open > 0 && unreviewed > 0 && " · "}
-          {unreviewed > 0 && `${unreviewed} not yet reviewed`}
-        </p>
-      )}
-
-      {!mayDecide && (
-        <p className="text-[12.5px] text-ink/60">
-          Only an architect, or an administrator, can decide what happens to a submission.
-          Ask one of them to take it.
-        </p>
-      )}
-
-      {mayDecide && (
-      <div className="flex flex-wrap gap-2">
-        {OUTCOMES.map((outcome) => {
-          const outcomeMeta = OUTCOME_META[outcome];
-          const Icon = ICON[outcome];
-          return (
-            <button
-              key={outcome}
-              type="button"
-              disabled={pending}
-              aria-pressed={chosen === outcome}
-              onClick={() => setChosen(chosen === outcome ? null : outcome)}
-              title={outcomeMeta.blurb}
-              className={cn(
-                "inline-flex items-center gap-1.5 rounded-lg border px-3 py-2 text-[12.5px] transition-[box-shadow,opacity]",
-                TONE[outcomeMeta.tone],
-                chosen === outcome ? "ring-2 ring-line-strong" : "opacity-70 hover:opacity-100",
-                "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-royal-mid",
-              )}
-            >
-              <Icon size={13} />
-              {outcomeMeta.label}
-            </button>
-          );
-        })}
-      </div>
-      )}
-
-      {mayDecide && chosen && meta && (
-        <div className="mt-3.5 rounded-xl border border-line bg-canvas-sunk p-4">
-          <p className="mb-3 text-[12.5px] text-ink/70">{meta.commitment}</p>
-
-          {/* Said before the attempt rather than after it. The refusal itself
-              lives in lib/ingest/outcomes.ts, where the report is in reach. */}
-          {meta.requiresFinding && (
-            <p className="mb-3 text-[12px] leading-relaxed text-ink/62">
-              A rejection has to rest on a breach this report cited — a contradiction, or a
-              requirement met only in part, with evidence behind it. Where the findings do not
-              carry the refusal, the case for it belongs to the board.
+      {/* The situation, then the call. The client's prototype states what is
+          outstanding immediately above the buttons rather than leaving it
+          somewhere up the page, and it is the one arrangement that makes an
+          approval an informed one: the sentence a reviewer would have to go
+          looking for is the sentence they read last. */}
+      <div className="overflow-hidden rounded-2xl border border-line bg-card shadow-card">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-line px-5 py-4">
+          <div className="min-w-0">
+            <p className="text-[13.5px] font-semibold text-ink">
+              {open > 0
+                ? `${open} finding${open === 1 ? "" : "s"} still contradict the standards`
+                : unreviewed > 0
+                  ? `${unreviewed} finding${unreviewed === 1 ? "" : "s"} not yet reviewed`
+                  : "Nothing outstanding on this submission"}
             </p>
-          )}
-
-          <label className="block">
-            <span className="mb-1.5 block text-[11.5px] text-ink/64">
-              {meta.requiresNote ? "Reason (required)" : "Reason (optional)"}
-            </span>
-            <textarea
-              value={note}
-              onChange={(event) => setNote(event.target.value)}
-              rows={3}
-              placeholder={PROMPT[chosen]}
-              className="w-full resize-y rounded-lg border border-line bg-card px-2.5 py-2 text-[13px] text-ink/88 placeholder:text-ink/58 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-royal-mid"
-            />
-          </label>
-
-          <div className="mt-3 flex items-center gap-2">
-            <button
-              type="button"
-              disabled={pending || (meta.requiresNote && !note.trim())}
-              onClick={submit}
-              className="inline-flex items-center gap-1.5 rounded-full bg-royal px-4 py-1.5 text-[12.5px] font-medium text-white transition-colors hover:bg-royal-mid disabled:opacity-40"
-            >
-              <Gavel size={13} />
-              Record {OUTCOME_META[chosen].label.toLowerCase()}
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                setChosen(null);
-                setNote("");
-              }}
-              className="text-[12.5px] text-ink/62 transition-colors hover:text-ink/78"
-            >
-              cancel
-            </button>
+            <p className="mt-0.5 text-[12.5px] leading-relaxed text-ink/70">
+              {open > 0 || unreviewed > 0
+                ? "Deciding anyway is a call you are entitled to make. It is recorded with what the report said at the time."
+                : "Every finding raised has been ruled on. Record the outcome to close the review."}
+            </p>
           </div>
+          <Pill tone={open > 0 ? "high" : unreviewed > 0 ? "medium" : "ok"}>
+            {open > 0 || unreviewed > 0 ? "Review required" : "Ready to decide"}
+          </Pill>
         </div>
-      )}
+
+        <div className="px-5 py-4">
+          {!mayDecide ? (
+            <p className="text-[12.5px] text-ink/60">
+              Only an architect, or an administrator, can decide what happens to a
+              submission. Ask one of them to take it.
+            </p>
+          ) : (
+            <>
+              <div className="flex flex-wrap gap-2.5">
+                {OUTCOMES.map((outcome) => {
+                  const outcomeMeta = OUTCOME_META[outcome];
+                  const Icon = ICON[outcome];
+                  return (
+                    <button
+                      key={outcome}
+                      type="button"
+                      disabled={pending}
+                      aria-pressed={chosen === outcome}
+                      onClick={() => setChosen(chosen === outcome ? null : outcome)}
+                      title={outcomeMeta.blurb}
+                      className={cn(
+                        "inline-flex items-center gap-2 rounded-lg border px-4 py-2.5 text-[13px] font-semibold",
+                        "transition-[background-color,border-color,box-shadow,color]",
+                        "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-royal-mid",
+                        ACTION[outcomeMeta.tone] ?? ACTION.warn,
+                        chosen === outcome && "ring-2 ring-line-strong",
+                        pending && "opacity-50",
+                      )}
+                    >
+                      <Icon size={14} />
+                      {outcomeMeta.label}
+                    </button>
+                  );
+                })}
+              </div>
+
+              {chosen && meta && (
+                <div className="mt-4 rounded-xl border border-line bg-canvas-sunk p-4">
+                  <p className="mb-3 text-[12.5px] text-ink/70">{meta.commitment}</p>
+
+                  {/* Said before the attempt rather than after it. The refusal
+                      itself lives in lib/ingest/outcomes.ts, where the report
+                      is in reach. */}
+                  {meta.requiresFinding && (
+                    <p className="mb-3 text-[12px] leading-relaxed text-ink/62">
+                      A rejection has to rest on a breach this report cited — a
+                      contradiction, or a requirement met only in part, with evidence
+                      behind it. Where the findings do not carry the refusal, the case for
+                      it belongs to the board.
+                    </p>
+                  )}
+
+                  <label className="block">
+                    <span className="mb-1.5 block text-[11.5px] font-medium text-ink/64">
+                      {meta.requiresNote ? "Reason (required)" : "Reason (optional)"}
+                    </span>
+                    <textarea
+                      value={note}
+                      onChange={(event) => setNote(event.target.value)}
+                      rows={3}
+                      placeholder={PROMPT[chosen]}
+                      className="w-full resize-y rounded-lg border border-line bg-card px-3 py-2 text-[13px] text-ink/88 placeholder:text-ink/58 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-royal-mid"
+                    />
+                  </label>
+
+                  <div className="mt-3 flex items-center gap-3">
+                    <button
+                      type="button"
+                      disabled={pending || (meta.requiresNote && !note.trim())}
+                      onClick={submit}
+                      className="inline-flex items-center gap-1.5 rounded-full bg-royal px-4 py-2 text-[12.5px] font-semibold text-white transition-colors hover:bg-royal-mid disabled:opacity-40"
+                    >
+                      <Gavel size={13} />
+                      Record {OUTCOME_META[chosen].label.toLowerCase()}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setChosen(null);
+                        setNote("");
+                      }}
+                      className="text-[12.5px] text-ink/62 transition-colors hover:text-ink/78"
+                    >
+                      cancel
+                    </button>
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      </div>
 
       {message && (
         <p role="status" className="mt-3 text-[12.5px] text-ink/70">

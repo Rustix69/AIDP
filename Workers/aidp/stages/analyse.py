@@ -21,14 +21,18 @@ gap into production.
 
 from __future__ import annotations
 
+import contextvars
 import re
-from dataclasses import dataclass, replace
+from collections import Counter
+from concurrent import futures
+from dataclasses import dataclass, field, replace
 
 from psycopg.types.json import Jsonb
 
 from .. import (
     advice,
     coverage,
+    credentials,
     db,
     decisions,
     designs,
@@ -38,8 +42,10 @@ from .. import (
     obligations,
     progress,
     queue,
+    request_intake,
     retrieval,
     rootcause,
+    stack,
     standards,
     usage,
     whole_document,
@@ -207,6 +213,19 @@ UNCONFIRMED_ABSENT = "Absent confirmation unavailable; verify manually."
 # given up on, and it carries a checked quote rather than certainty.
 CONFIRM_CONFIDENCE = 0.7
 
+# The least a clause could plausibly cost, in whatever currency the provider
+# reports a balance in.
+#
+# A floor, deliberately not an estimate. Real cost swings with how much of the
+# design goes into each prompt, and whole-document mode puts the whole design
+# in every one: one 170-clause run over an eleven-page design billed 4.4M input
+# tokens and about $0.012 a clause. This sits an order of magnitude under that,
+# because the two errors are not symmetrical — refusing a run that would have
+# finished is worse than letting a cheap one through, while the case this has
+# to catch is not subtle. A key with $0.11 on it was asked for $2 of work, and
+# "has credit" was true right up until clause nine.
+MIN_CREDIT_PER_CLAUSE = 0.002
+
 # The longest rationale kept.
 #
 # This was 280, and 280 was the cause of the worst output this engine produced.
@@ -322,6 +341,20 @@ def _purpose(conn, scope: designs.Scope) -> str:
     )
 
 
+def _stack_block(conn, rows: stack.Stack, scope: designs.Scope) -> str:
+    """What the technology stack says, for the designs in this scope.
+
+    Empty whenever the organisation has no stack indexed, which is the ordinary
+    case and leaves every clause reading exactly as it did before this existed.
+    """
+    if not rows or not scope.designs:
+        return ""
+    text = stack.design_text(conn, scope.document_ids)
+    if not text:
+        return ""
+    return stack.render(rows, stack.names_in(rows, text))
+
+
 def _context(conn, scope: designs.Scope) -> str:
     """What the work under assessment is for, in the judge's words.
 
@@ -378,6 +411,45 @@ def _context(conn, scope: designs.Scope) -> str:
     return framed(intro + "\n\n" + "\n\n".join(blocks))
 
 
+def _not_adopted(conn, framework_id: str) -> int:
+    """How many live clauses this organisation has suspended.
+
+    Kept under its old name because the run note that reads it is phrased
+    around "how much of the library was left out", which is the same question.
+    """
+    row = db.one(
+        conn,
+        """
+        SELECT count(*) AS n
+          FROM "framework_document" fd
+          JOIN "document_section" s ON s."documentId" = fd."documentId"
+          JOIN "clause" cl          ON cl."sectionId" = s."id"
+         WHERE fd."frameworkId" = %s
+           AND cl."supersededById" IS NULL
+           AND cl."status" = 'suspended'
+        """,
+        (framework_id,),
+    )
+    return int(row["n"]) if row else 0
+
+
+def _with_not_adopted(note: str | None, skipped: int) -> str | None:
+    """The run's note, saying how much of the library it was told to leave out.
+
+    Without this a run over 150 of 170 clauses looks like a run that lost
+    twenty, and the first question about the report is one the report cannot
+    answer. The same reasoning as `_with_unready`: a partial scope is fine, a
+    silent one is not.
+    """
+    if skipped <= 0:
+        return note
+    said = (
+        f"{skipped} clause{'s' if skipped != 1 else ''} not assessed: rejected in "
+        "your standards library."
+    )
+    return f"{note} {said}" if note else said
+
+
 def _with_unready(note: str | None, scope: designs.Scope) -> str | None:
     """The run's note, saying which designs it could not read.
 
@@ -411,6 +483,16 @@ def handle(job: Job, heartbeat) -> None:
         _draft_standard(job, draft_id)
         return
 
+    # Reading a request's attached designs for the intake form's structured
+    # questions. Not an assessment either: no run, no findings, and the only row
+    # written is the proposal sheet a requestor is waiting on. Here for the
+    # reason the clause draft above is here — one model call that wants this
+    # worker's key and its lease, and a fifth container for it would idle.
+    request_id = job.payload.get("requestId")
+    if request_id:
+        _read_intake(job, request_id)
+        return
+
     run_id = job.payload.get("runId")
     if not run_id:
         raise RuntimeError("analyse job has no runId in its payload")
@@ -430,6 +512,9 @@ def handle(job: Job, heartbeat) -> None:
         if run is None:
             raise RuntimeError(f"assessment run {run_id} no longer exists")
         clauses = _framework_clauses(conn, run["frameworkId"])
+        # Counted inside the same connection as the clauses themselves, so the
+        # number on the report and the clauses judged describe one library.
+        not_adopted = _not_adopted(conn, run["frameworkId"])
         # One design, or every finished design in a project. Everything below
         # reads this rather than run["documentId"], which is null on a project
         # run. See designs.py.
@@ -439,6 +524,27 @@ def handle(job: Job, heartbeat) -> None:
         # trips for one column.
         document_context = _context(conn, scope)
         per_design = bool(run.get("projectId") and scope.alternatives)
+        # What the organisation's technology stack says about the technologies
+        # these designs name. Read once per run: the block is identical for
+        # every clause, and only the clauses that are about the stack are shown
+        # it at all — see stack.concerns_technology.
+        #
+        # Split per design wherever the contexts are, and for the same reason
+        # advice._worked_out gives: a design judged against alternatives must
+        # never be shown another design's technologies, or the judge reports
+        # one design for using what a different one chose.
+        stack_rows = stack.load(conn, run["organisationId"])
+        stack_block = _stack_block(conn, stack_rows, scope)
+        stack_blocks = (
+            {
+                design.document_id: _stack_block(
+                    conn, stack_rows, designs.only(scope, design.document_id)
+                )
+                for design in scope.designs
+            }
+            if per_design
+            else {}
+        )
         tasks = (
             [
                 (clause, design.document_id)
@@ -509,6 +615,7 @@ def handle(job: Job, heartbeat) -> None:
     progress.step("Preparing the assessment")
     mode, note, whole = _resolve_mode(run, scope)
     note = _with_unready(note, scope)
+    note = _with_not_adopted(note, not_adopted)
 
     pending = [
         (clause, design_id)
@@ -516,6 +623,8 @@ def handle(job: Job, heartbeat) -> None:
         if (clause["id"], design_id or "") not in done
     ]
     completed = len(tasks) - len(pending)
+    # Before the first clause, not after the fifty-fifth.
+    _refuse_without_credit(len(pending))
     _start(
         run_id,
         total=len(tasks),
@@ -534,6 +643,8 @@ def handle(job: Job, heartbeat) -> None:
         designAssessments=len(tasks),
         resuming=completed,
         pending=len(pending),
+        readings=get_config().judge_readings,
+        concurrency=min(get_config().assess_concurrency, max(1, len(pending))),
     )
     if note:
         logs.warn(log, "whole-document assessment fell back to search", runId=run_id, reason=note)
@@ -551,88 +662,146 @@ def handle(job: Job, heartbeat) -> None:
         else "Assessing clauses by search"
     )
     refused = 0
-    for index, (clause, design_id) in enumerate(pending, start=1):
-        progress.step(step_label, done=completed + index - 1, total=len(tasks))
+    # Clauses judged at once. Each is an independent question committed in its
+    # own transaction, so nothing about the work was ever sequential — the loop
+    # simply was, and at roughly fifteen seconds a clause that made a
+    # hundred-and-twenty-clause framework half an hour of waiting and a
+    # three-design project an hour and a half. The work is all provider latency;
+    # the ceiling is the key's rate limit, not this machine.
+    workers = max(1, min(get_config().assess_concurrency, len(pending)))
+
+    def judge_task(clause: dict, design_id: str | None) -> None:
+        """One clause, start to committed finding. Runs on a pool thread."""
         unit_scope = designs.only(scope, design_id) if design_id else scope
         unit_context = task_contexts.get(design_id, document_context)
-        try:
-            if whole is not None:
-                _assess_document_one(run, clause, whole, unit_scope, unit_context)
-            else:
-                _assess_one(run, clause, unit_scope, unit_context, design_id=design_id)
-        except llm.QuotaExhausted:
-            # Not this clause's problem and not survivable: every clause after
-            # it would fail the same way, and the run is worth retrying once
-            # the customer's credit is back. Let the job layer back off.
-            raise
-        except Exception as exc:  # noqa: BLE001 — one clause must not cost the other ninety-nine
-            # A clause that cannot be judged is recorded as needing a person,
-            # and the run goes on.
-            #
-            # Before this, anything raised here — a model returning JSON that
-            # does not parse, a provider 500, one unreadable figure — aborted
-            # the whole run. The clauses already committed stayed (each is its
-            # own transaction), the rest were never attempted, and the report
-            # opened showing however few had landed before the failure, with a
-            # dead-lettered job as the only trace. A hundred-clause framework
-            # reporting one clause is that bug, and it looks like a limit
-            # somebody left in rather than the single failure it is.
-            #
-            # `needs_review` rather than a silent skip: the clause was in scope
-            # and was not judged, and the one thing the report must not do is
-            # imply it passed. The rationale says what happened so a reviewer
-            # knows this is a system failure and not a reading of their design.
-            refused += 1
-            logs.warn(
-                log,
-                "clause could not be judged, continuing",
-                runId=run_id,
-                clauseId=clause["id"],
-                clauseRef=clause.get("numberText") or clause["id"],
-                error=f"{type(exc).__name__}: {exc}"[:300],
+        unit_stack = stack_blocks.get(design_id, stack_block)
+        if whole is not None:
+            _assess_document_one(
+                run, clause, whole, unit_scope, unit_context, stack_block=unit_stack
             )
+        else:
+            _assess_one(
+                run,
+                clause,
+                unit_scope,
+                unit_context,
+                design_id=design_id,
+                stack_block=unit_stack,
+            )
+
+    progress.step(step_label, done=completed, total=len(tasks))
+    quota: llm.QuotaExhausted | None = None
+    stopped = False
+    finished = 0
+
+    with futures.ThreadPoolExecutor(max_workers=workers, thread_name_prefix="judge") as pool:
+        # `copy_context().run` per task, and the copy is taken here on the
+        # worker's own thread rather than inside the pool. The credential this
+        # job's model calls are made with, the attribution its spend is booked
+        # to and the progress tracker are all ContextVars bound once per job in
+        # __main__ — and a thread started by a pool does not inherit them. Left
+        # to itself, every clause on a pool thread would have looked for an API
+        # key that was not there. A fresh copy per task because a Context cannot
+        # be entered twice at once, which is exactly what concurrency means
+        # here.
+        running = {
+            pool.submit(contextvars.copy_context().run, judge_task, clause, design_id): (
+                clause,
+                design_id,
+            )
+            for clause, design_id in pending
+        }
+        for future in futures.as_completed(running):
+            clause, design_id = running[future]
             try:
-                _write(
-                    run_id,
-                    clause,
-                    verdict="needs_review",
-                    confidence=0.0,
-                    rationale=(
-                        "This clause could not be assessed: the model did not return a usable "
-                        "answer for it. Nothing is implied about the design. Run the assessment "
-                        "again to retry this clause."
-                    ),
-                    evidence=[],
-                    retrieval_score=0.0,
-                    applied=[],
-                    design_id=design_id,
-                )
-            except Exception as write_exc:  # noqa: BLE001 — the database is the one thing worth stopping for
+                future.result()
+            except futures.CancelledError:
+                continue
+            except llm.QuotaExhausted as exc:
+                # Not this clause's problem and not survivable: every clause
+                # after it would fail the same way, and the run is worth
+                # retrying once the customer's credit is back. Stop handing out
+                # work, let what is in flight finish, and raise below so the
+                # job layer backs off.
+                quota = exc
+                for other in running:
+                    other.cancel()
+                break
+            except Exception as exc:  # noqa: BLE001 — one clause must not cost the other ninety-nine
+                # A clause that cannot be judged is recorded as needing a
+                # person, and the run goes on.
+                #
+                # Before this, anything raised here — a model returning JSON
+                # that does not parse, a provider 500, one unreadable figure —
+                # aborted the whole run. The clauses already committed stayed
+                # (each is its own transaction), the rest were never attempted,
+                # and the report opened showing however few had landed before
+                # the failure, with a dead-lettered job as the only trace.
+                #
+                # `needs_review` rather than a silent skip: the clause was in
+                # scope and was not judged, and the one thing the report must
+                # not do is imply it passed.
+                refused += 1
                 logs.warn(
                     log,
-                    "clause failure could not be recorded",
+                    "clause could not be judged, continuing",
                     runId=run_id,
                     clauseId=clause["id"],
-                    error=str(write_exc)[:200],
+                    clauseRef=clause.get("numberText") or clause["id"],
+                    error=f"{type(exc).__name__}: {exc}"[:300],
                 )
-        heartbeat()
-        # Every clause, not every fifth. A clause takes around fifteen seconds,
-        # so batching the write held the progress bar still for over a minute at
-        # a time — long enough that a run in perfect health reads as a hung one,
-        # which is what a progress bar exists to rule out. The cost is one small
-        # UPDATE per clause against a row already in cache, spaced fifteen
-        # seconds apart; the model call beside it dwarfs it.
-        if _progress(run_id, completed + index) == 0:
-            logs.info(
-                log,
-                "run is no longer running, abandoning it",
-                runId=run_id,
-                clausesDone=completed + index,
-            )
-            with db.transaction() as conn:
-                queue.complete(conn, job, chain=False)
-            return
+                try:
+                    _write(
+                        run_id,
+                        clause,
+                        verdict="needs_review",
+                        confidence=0.0,
+                        rationale=(
+                            "This clause could not be assessed: the model did not return a "
+                            "usable answer for it. Nothing is implied about the design. Run "
+                            "the assessment again to retry this clause."
+                        ),
+                        evidence=[],
+                        retrieval_score=0.0,
+                        applied=[],
+                        design_id=design_id,
+                    )
+                except Exception as write_exc:  # noqa: BLE001 — the database is the one thing worth stopping for
+                    logs.warn(
+                        log,
+                        "clause failure could not be recorded",
+                        runId=run_id,
+                        clauseId=clause["id"],
+                        error=str(write_exc)[:200],
+                    )
 
+            finished += 1
+            heartbeat()
+            progress.step(step_label, done=completed + finished, total=len(tasks))
+            # Every clause, not every fifth. Batching the write held the
+            # progress bar still long enough that a run in perfect health read
+            # as a hung one, which is what a progress bar exists to rule out.
+            # The cost is one small UPDATE against a row already in cache; the
+            # model calls beside it dwarf it.
+            if _progress(run_id, completed + finished) == 0:
+                logs.info(
+                    log,
+                    "run is no longer running, abandoning it",
+                    runId=run_id,
+                    clausesDone=completed + finished,
+                )
+                for other in running:
+                    other.cancel()
+                stopped = True
+                break
+    # The pool is shut down by here, so nothing is still writing findings for a
+    # run that is being abandoned or a key that is spent.
+    if quota is not None:
+        raise quota
+    if stopped:
+        with db.transaction() as conn:
+            queue.complete(conn, job, chain=False)
+        return
     # Said once, at the end, rather than only per clause: a run where the model
     # failed on a third of the framework is still a complete run, and whoever
     # reads the log should see that in one line instead of counting warnings.
@@ -771,6 +940,35 @@ def _suggest_again(job: Job, run_id: str, heartbeat) -> None:
     )
 
 
+def _read_intake(job: Job, request_id: str) -> None:
+    """Fill in what the attached designs already answer, and nothing else.
+
+    Queued from the intake wizard by a requestor who would rather not retype
+    their own design. The request's answers are untouched: this writes
+    proposals, and a person accepts them — see Workers/aidp/request_intake.py
+    for the checks every proposal passes first.
+
+    The questions come down on the payload rather than being listed in Python,
+    so the catalogue has one definition (src/lib/ingest/reading-vocabulary.ts)
+    instead of two that drift.
+    """
+    progress.step("Reading the attached designs for the answers")
+    questions = job.payload.get("questions")
+    result = request_intake.record(
+        request_id, questions if isinstance(questions, list) else []
+    )
+    with db.transaction() as conn:
+        queue.complete(conn, job)
+    logs.info(
+        log,
+        "intake reading finished",
+        jobId=job.id,
+        requestId=request_id,
+        state=result.get("state"),
+        proposed=result.get("proposed"),
+    )
+
+
 def _draft_standard(job: Job, draft_id: str) -> None:
     """Write the requirement lines one clause was missing, and nothing else.
 
@@ -819,6 +1017,18 @@ def _framework_clauses(conn, framework_id: str) -> list[dict]:
            -- without this every sharpened clause would be judged twice and the
            -- report would show two of it.
            AND cl."supersededById" IS NULL
+           -- And only what this organisation still requires. A design cannot
+           -- breach a rule its owner has set aside, and reporting one as a gap
+           -- would be the engine arguing with the customer about their own
+           -- standards.
+           --
+           -- Written as "not suspended" rather than "is active" on purpose:
+           -- only an explicit suspension takes a clause out of scope, so an
+           -- unexpected value still gets judged. The alternative fails silent,
+           -- and a clause that stops being assessed without saying so is the
+           -- worst way for this column to go wrong. Matches `readClauseStatus`,
+           -- which reads anything it does not recognise as active.
+           AND cl."status" <> 'suspended'
          ORDER BY fd."sortOrder", d."title", s."ordinal", cl."ordinal"
         """,
         (framework_id,),
@@ -839,6 +1049,179 @@ class _Judged:
     # reading of it gets the last word. Carried rather than resolved here so
     # `_write` applies one rule for every path — see `obligations.resolve`.
     obligation: str = ""
+    # How many independent readings of this clause were taken, and how many of
+    # them reached the verdict above. Recorded on the finding, because "three of
+    # three readings agreed" and "two of three" are different claims and a
+    # reviewer deciding what to look at first is entitled to know which this is.
+    readings: int = 1
+    agreed: int = 1
+    # What the readings that disagreed said: [{verdict, rationale}].
+    #
+    # Kept rather than discarded, for the reason `reviewerVerdict` sits beside
+    # `verdict` rather than over it — the disagreement is the evaluation data.
+    # A minority reading of "contradicts" under a majority "covered" is the
+    # single most useful line in the report for whoever has to sign it off, and
+    # throwing it away would leave the vote asserting a confidence it does not
+    # have.
+    dissent: list[dict] = field(default_factory=list)
+
+
+# What a dissenting reading's rationale is cut to. It is context beside the
+# verdict that won, not the finding itself.
+MAX_DISSENT = 240
+
+
+def _settled(taken: list[_Judged], readings: int) -> bool:
+    """Whether the readings still to come could change which verdict leads.
+
+    The early stop, and it stops on the one condition that makes stopping free:
+    the leader cannot be caught. Taking another reading when the answer is
+    already decided buys nothing, and the extra readings are the whole cost of
+    reading a clause more than once.
+
+    With three readings that means two agreeing ends it — a third cannot
+    overturn a 2-0 lead — so an uncontested clause costs two and only a
+    contested one costs three. That is exactly a best-of-three, reached in
+    fewer calls: for a clause the model favours with probability p, this yields
+    its favourite with probability p² + 2p(1-p)·p, which is p³ + 3p²(1-p). The
+    same number. The early stop is an implementation of the vote, not an
+    approximation of it.
+
+    It has to be read against `readings` rather than against the constant 2,
+    which is the bug this replaces. Stopping at any two agreeing made
+    JUDGE_READINGS=5 behave as 3 — the fourth and fifth readings were only ever
+    reached on a three-way split — so the setting looked like it was doing
+    something while changing almost nothing, and two measurements of the same
+    algorithm got read as a trend.
+    """
+    if len(taken) < 2:
+        return False
+    ranked = Counter(judged.verdict for judged in taken).most_common()
+    leader = ranked[0][1]
+    runner_up = ranked[1][1] if len(ranked) > 1 else 0
+    remaining = max(0, readings - len(taken))
+    return leader > runner_up + remaining
+
+
+def _vote(taken: list[_Judged]) -> _Judged:
+    """One verdict out of several readings of one clause: what most of them said.
+
+    The same discipline as `coverage.agree`, applied to the thing the product
+    is. A model asked the same question twice does not answer it the same way
+    twice — two runs over one design came back 9 absent and 4 needing review,
+    then 7 and 7 — and an assessment that moves between Tuesday and Thursday is
+    not one an architecture board can be shown. Reading each clause more than
+    once and keeping what most readings said is what makes a run repeatable.
+
+    Voting happens *after* the guards, on final answers, not on the model's raw
+    replies. A reading the guards demoted votes for the demotion, which is
+    right: it is this engine's answer for that reading, and the whole point of
+    the guards is that they are part of the verdict rather than a filter over it.
+
+    No majority is not a verdict. Where the readings split with nothing ahead —
+    three readings, three answers — the clause goes to a person, with every
+    reading's answer attached. That is the honest result, and it is a better
+    finding than any one of the three: the engine knows the clause is contested,
+    and says so, rather than picking a winner by arrival order.
+    """
+    if len(taken) == 1:
+        return taken[0]
+
+    ranked = Counter(judged.verdict for judged in taken).most_common()
+    leader, votes = ranked[0]
+    split = len(ranked) > 1 and ranked[1][1] == votes
+
+    # Among the readings that agree, the one that was surest of itself carries
+    # the rationale and the evidence. They reached the same verdict, so this
+    # chooses between wordings rather than between answers.
+    chosen = max(
+        (judged for judged in taken if judged.verdict == leader),
+        key=lambda judged: judged.confidence,
+    )
+    dissent = [
+        {"verdict": judged.verdict, "rationale": _shorten(judged.rationale, MAX_DISSENT)}
+        for judged in taken
+        if judged.verdict != leader
+    ]
+
+    if split:
+        others = ", ".join(f"{verdict} x{count}" for verdict, count in ranked)
+        verdict, rationale = _demoted(
+            f"Read {len(taken)} times with no answer in the majority ({others}).",
+            chosen.rationale,
+        )
+        return replace(
+            chosen,
+            verdict=verdict,
+            rationale=rationale,
+            readings=len(taken),
+            agreed=votes,
+            dissent=dissent,
+        )
+
+    return replace(chosen, readings=len(taken), agreed=votes, dissent=dissent)
+
+
+def _read_and_vote(
+    judge_once,
+    readings: int,
+    *,
+    best: float,
+    clause: dict,
+) -> _Judged:
+    """Judge one clause `readings` times, stopping early on agreement, and vote.
+
+    A reading that fails is not a reading that voted. It is logged and skipped,
+    and the next one is taken — one provider hiccup out of three should not put
+    a clause in front of a person. Only a clause where *every* reading failed
+    comes back unjudged, which is the single-reading behaviour and says so.
+
+    `QuotaExhausted` is the exception to all of this and is re-raised. It is not
+    this clause's problem: every clause after it would fail the same way, and a
+    run that swallowed it would write a hundred "could not be judged" findings
+    and then report itself complete — which is how a spent key reached a
+    customer's report looking like a hundred unanswerable clauses.
+    """
+    taken: list[_Judged] = []
+    failure = ""
+    failure_kind = ""
+    for reading in range(max(1, readings)):
+        try:
+            taken.append(judge_once(reading))
+        except llm.QuotaExhausted:
+            raise
+        except Exception as exc:  # noqa: BLE001 — one reading must not cost the clause
+            failure = f"{type(exc).__name__}: {exc}"
+            failure_kind = type(exc).__name__
+            logs.warn(
+                log,
+                "one reading of a clause failed, continuing",
+                clauseId=clause["id"],
+                reading=reading,
+                error=failure[:200],
+            )
+        if _settled(taken, readings):
+            break
+
+    if not taken:
+        return _Judged(
+            "needs_review",
+            0.0,
+            # The provider's own error body must never reach this string. This is
+            # the customer-facing rationale, printed into a compliance report —
+            # and interpolating `failure` here put a raw
+            # {"error":{"message":...,"metadata":{"raw":...}}} payload into 596
+            # stored findings, a quarter of every finding in the database. The
+            # exception type is as much as a reader can act on; the full failure
+            # is on the warn above, which is where a diagnostic belongs.
+            "This clause was not judged: the model's answer could not be read. "
+            "Run the assessment again."
+            + (f" ({failure_kind})" if failure_kind else ""),
+            [],
+            [],
+            best,
+        )
+    return _vote(taken)
 
 
 def _assess_one(
@@ -848,6 +1231,7 @@ def _assess_one(
     document: str = "",
     *,
     design_id: str | None = None,
+    stack_block: str = "",
 ) -> None:
     """Retrieve, judge, guard, commit — one clause, one transaction."""
     query = retrieval.clause_query(
@@ -867,6 +1251,8 @@ def _assess_one(
         vector=vector,
         precedents=precedents,
         document=document,
+        readings=get_config().judge_readings,
+        stack_block=stack_block,
     )
     _write(
         run["id"],
@@ -879,6 +1265,9 @@ def _assess_one(
         applied=judged.applied,
         judged_obligation=judged.obligation,
         design_id=design_id,
+        readings=judged.readings,
+        agreed=judged.agreed,
+        dissent=judged.dissent,
     )
 
 
@@ -928,11 +1317,19 @@ def _judge_by_search(
     vector: str,
     precedents: list,
     document: str = "",
+    readings: int = 1,
+    stack_block: str = "",
 ) -> _Judged:
     """The passages a search finds for the clause, judged and guarded.
 
     The whole of a retrieval-mode assessment, and the second opinion a
     whole-document assessment asks for before it will call anything absent.
+
+    The search runs once however many readings are taken. It is deterministic —
+    the same clause makes the same query, which makes the same vector and the
+    same lexical match — so repeating it would buy nothing and would bill the
+    embedding provider once per reading. What varies between readings is the
+    judgement, which is the part that varies in the first place.
     """
     reference = f"{clause['documentTitle']} — {clause['headingPath']}"
     with db.connection() as conn:
@@ -962,10 +1359,10 @@ def _judge_by_search(
             0.0,
         )
 
-    try:
+    def once(reading: int) -> _Judged:
         raw = llm.judge(
             reference=reference,
-            clause=_render_clause(clause),
+            clause=_render_clause(clause, stack_block=stack_block),
             extracts=_render_extracts(
                 candidates, named=len(scope.designs) > 1 or scope.alternatives
             ),
@@ -990,19 +1387,29 @@ def _judge_by_search(
             alternatives=scope.alternatives,
             precedents=decisions.render(precedents),
             document=document,
+            # Which reading this is. Reading zero is deterministic; the ones
+            # after it are sampled on their own seed, or three readings would
+            # be one opinion billed three times. See `llm.judge_sampling`.
+            reading=reading,
         )
-    except Exception as exc:  # noqa: BLE001 — one clause must not sink the run
-        logs.warn(log, "judge failed for clause", clauseId=clause["id"], error=str(exc)[:200])
-        return _Judged(
-            "needs_review",
-            0.0,
-            "This clause was not judged: the model's answer could not be read. Run the "
-            f"assessment again. ({str(exc)[:120]})",
-            [],
-            [],
-            best,
-        )
+        return _judged_from(raw, clause, candidates, precedents, best)
 
+    return _read_and_vote(once, readings, best=best, clause=clause)
+
+
+def _judged_from(
+    raw: dict,
+    clause: dict,
+    candidates: list[retrieval.Candidate],
+    precedents: list,
+    best: float,
+) -> _Judged:
+    """One reply from the judge, normalised, checked against the extracts, guarded.
+
+    Split out of `_judge_by_search` so that every reading of a clause goes
+    through exactly the same checks before it is allowed to vote. A reading the
+    guards demoted votes for the demotion — see `_vote`.
+    """
     verdict, confidence, rationale, cited, claimed = _normalise(raw, clause)
     by_id = {c.chunk_id: c for c in candidates}
     generated = {c.chunk_id for c in candidates if c.is_generated}
@@ -1034,8 +1441,10 @@ def _judge_by_search(
         verdict, confidence, evidence, best, rationale, cited_generated=cited_figures,
         cited_total=len([c for c in cited if c in by_id]),
         fabricated=fabricated,
+        offered=len(precedents),
         conflicted=decisions.conflicting(precedents),
-        clause_text=_render_clause(clause),
+        # Without the obligation line or the stack: see `_render_clause`.
+        clause_text=_render_clause(clause, with_force=False),
         figure_text=" ".join(
             c.excerpt for cid in cited_figures if (c := by_id.get(cid)) is not None
         ),
@@ -1057,7 +1466,12 @@ def _judge_by_search(
 # Whole-document mode
 # ---------------------------------------------------------------------------
 
+#: What a run can be asked for. "auto" is the default and is not a third way of
+#: reading a design — it is the engine choosing between the two, which it is
+#: better placed to do than the person pressing the button: whether a design
+#: fits a whole-document read is a question about its token count.
 MODES = ("retrieval", "document")
+AUTO = "auto"
 
 # Quotes checked per verdict. A reply quoting more than this is padding, and
 # every quote is a search through the whole document.
@@ -1080,9 +1494,21 @@ def _resolve_mode(
     the designs reaches the same verdicts with every quote still checked against
     the design it came from, and the absent re-read still reads each design
     whole, one at a time.
+
+    "auto" — the default — resolves here rather than at the button, because the
+    thing it turns on is the design's token count and nobody pressing assess
+    knows that. It reads a single design whole whenever it fits, which is the
+    stronger method and the one that cannot report a clause absent because the
+    passage answering it fell outside a window of eight. An explicit
+    "retrieval" is still honoured: a reviewer who asked for search gets search.
     """
+    wanted = run.get("mode") or "retrieval"
+    auto = wanted == AUTO
+    if auto:
+        wanted = "document" if get_config().prefer_whole_document else "retrieval"
+
     if len(scope.designs) != 1:
-        asked = (run.get("mode") or "retrieval") == "document"
+        asked = wanted == "document" and not auto
         return (
             "retrieval",
             (
@@ -1094,15 +1520,22 @@ def _resolve_mode(
             else None,
             None,
         )
-    if (run.get("mode") or "retrieval") != "document":
+    if wanted != "document":
         return "retrieval", None, None
     only = scope.designs[0]
     with db.connection() as conn:
         whole = whole_document.load(conn, only.document_id, only.title)
+    # An auto run was not promised a whole-document read, so falling back to
+    # search is not a failed request and does not read as one. It still says
+    # which method produced the results, which is the part that matters: a
+    # reader must never have to guess how a verdict was reached.
     if whole is None:
         return (
             "retrieval",
-            "Assessed by search, not by reading the whole document: this document was "
+            "Assessed by search. This document was processed before its pages were stored, "
+            "so it cannot be read whole yet — reprocess it to assess it that way."
+            if auto
+            else "Assessed by search, not by reading the whole document: this document was "
             "processed before its pages were stored. Reprocess it, then run the "
             "whole-document assessment again.",
             None,
@@ -1111,7 +1544,10 @@ def _resolve_mode(
     if whole.tokens > limit:
         return (
             "retrieval",
-            f"Assessed by search, not by reading the whole document: it is about "
+            f"Assessed by search. At about {whole.tokens:,} tokens this design is longer "
+            f"than the {limit:,} a whole-document assessment reads at once."
+            if auto
+            else f"Assessed by search, not by reading the whole document: it is about "
             f"{whole.tokens:,} tokens, more than the {limit:,} a whole-document "
             "assessment reads at once.",
             None,
@@ -1125,6 +1561,8 @@ def _assess_document_one(
     whole: whole_document.WholeDocument,
     scope: designs.Scope,
     document_context: str = "",
+    *,
+    stack_block: str = "",
 ) -> None:
     """Read the whole document, judge, check every quote, commit — one clause.
 
@@ -1133,6 +1571,11 @@ def _assess_document_one(
     reading of the whole document can still get wrong without quoting anything.
     That second opinion is given the document summary exactly as a search-mode
     run is, so the two modes' search verdicts on a clause are the same question.
+    The stack block rides with it for that same reason. A search asked about a
+    technology clause with no sight of the stack answers a different question
+    from the one the whole-document reading answered, and `_overrides_absent`
+    below would read the disagreement as "one of the two readings missed
+    something" — which is how EA-007 was lost once already.
     """
     query = retrieval.clause_query(
         clause["statement"], clause["requirements"] or [], clause["title"]
@@ -1141,44 +1584,44 @@ def _assess_document_one(
     vector = retrieval.embed_query(query)
     precedents = _precedents(run, clause, query, vector, scope)
 
-    try:
+    def once(reading: int) -> _Judged:
         raw = llm.judge_document(
             document=whole.text,
             reference=reference,
-            clause=_render_clause(clause),
+            clause=_render_clause(clause, stack_block=stack_block),
             precedents=decisions.render(precedents),
+            reading=reading,
         )
-    except Exception as exc:  # noqa: BLE001 — one clause must not sink the run
-        logs.warn(log, "judge failed for clause", clauseId=clause["id"], error=str(exc)[:200])
-        _write(
-            run["id"],
-            clause,
-            verdict="needs_review",
-            confidence=0.0,
-            rationale=(
-                "This clause was not judged: the model's answer could not be read. Run the "
-                f"assessment again. ({str(exc)[:120]})"
-            ),
-            evidence=[],
-            retrieval_score=0.0,
-            applied=[],
-            design_id=scope.designs[0].document_id if not run.get("projectId") else None,
+        verdict, confidence, rationale, _, claimed = _normalise(raw, clause)
+        evidence, unverified = _checked_quotes(raw, whole)
+        applied, fabricated = _applied(precedents, claimed)
+        verdict, rationale = _guard_document(
+            verdict,
+            confidence,
+            rationale,
+            evidence=evidence,
+            unverified=unverified,
+            fabricated=fabricated,
+            offered=len(precedents),
+            conflicted=decisions.conflicting(precedents),
+            clause_text=_render_clause(clause, with_force=False),
         )
-        return
+        return _Judged(
+            verdict,
+            confidence,
+            rationale,
+            evidence,
+            applied,
+            0.0,
+            obligation=str(raw.get("obligation") or ""),
+        )
 
-    verdict, confidence, rationale, _, claimed = _normalise(raw, clause)
-    evidence, unverified = _checked_quotes(raw, whole)
-    applied, fabricated = _applied(precedents, claimed)
-    verdict, rationale = _guard_document(
-        verdict,
-        confidence,
-        rationale,
-        evidence=evidence,
-        unverified=unverified,
-        fabricated=fabricated,
-        conflicted=decisions.conflicting(precedents),
-        clause_text=_render_clause(clause),
-    )
+    judged = _read_and_vote(once, get_config().judge_readings, best=0.0, clause=clause)
+    verdict = judged.verdict
+    confidence = judged.confidence
+    rationale = judged.rationale
+    evidence = judged.evidence
+    applied = judged.applied
 
     score = 0.0
     if verdict == "absent":
@@ -1190,9 +1633,32 @@ def _assess_document_one(
             vector=vector,
             precedents=precedents,
             document=document_context,
+            readings=get_config().judge_readings,
+            stack_block=stack_block,
         )
-        score = second.best
-        if second.verdict in CITING_VERDICTS and second.evidence:
+        # Only a search that *decides* the clause outranks the reading that saw
+        # the whole document.
+        #
+        # A whole-document read has strictly more to go on than eight retrieved
+        # chunks, so the search is a safety net against it missing a passage —
+        # which is a real risk for "absent", and the reason this check exists.
+        # But a search answering "partial" has not found a passage that settles
+        # anything; over eight chunks with no surrounding document, "partial" is
+        # the cheap hedge, and rule 4 of the judge prompt exists because its
+        # evidence is so often an adjacent subject.
+        #
+        # Taking any citing verdict was costing every absent in the run: EA-007,
+        # EA-015 and INF-006 all went to needs_review on a search "partial",
+        # EA-015 for a design that names no Databricks, SageMaker or Bedrock
+        # anywhere. The check had been quiet only because the search's own
+        # verdict used to be demoted before it got here — see `fabricated` in
+        # `_guard` — so this is the same bug surfacing in a second place.
+        if _overrides_absent(second.verdict, second.evidence):
+            # Set here rather than above: on the branches below the verdict stays
+            # "absent" and keeps the whole-document read's (empty) evidence, and a
+            # retrieval score on a finding that cites nothing describes work that
+            # did not support it.
+            score = second.best
             verdict = "needs_review"
             rationale = (
                 "Reading the whole document found nothing on this clause, but a search of "
@@ -1201,6 +1667,19 @@ def _assess_document_one(
                 f"passages below. Whole-document reading: {rationale}"
             )
             evidence = second.evidence
+        elif second.verdict in CITING_VERDICTS and second.evidence:
+            # Kept, not discarded: the disagreement is real even where it is not
+            # strong enough to overturn the verdict, and a reviewer doubting an
+            # absent is exactly who should know a search found something. The
+            # search's passages are deliberately not attached — this finding is
+            # still "absent", and evidence under it would read as a citation for
+            # a verdict that cites nothing.
+            verdict, rationale = _noted(
+                verdict,
+                f"(A search of the same document found passages it judged "
+                f"'{second.verdict}'; none of them decides the clause, so this stands.)",
+                rationale,
+            )
 
     _write(
         run["id"],
@@ -1211,8 +1690,11 @@ def _assess_document_one(
         evidence=evidence,
         retrieval_score=score,
         applied=applied,
-        judged_obligation=str(raw.get("obligation") or ""),
+        judged_obligation=judged.obligation,
         design_id=scope.designs[0].document_id if not run.get("projectId") else None,
+        readings=judged.readings,
+        agreed=judged.agreed,
+        dissent=judged.dissent,
     )
 
 
@@ -1454,7 +1936,20 @@ def _confirm(run: dict, clauses: list[dict], scope: designs.Scope) -> None:
 
 
 def _render_absent(clauses: list[dict]) -> str:
-    """The batch, numbered. The reply answers by number, never in the clause's words."""
+    """The batch, numbered. The reply answers by number, never in the clause's words.
+
+    The one judge path that is deliberately not given the stack block, and the
+    reason is the batch. This renders `CONFIRM_BATCH` clauses into a single
+    prompt, so attaching a thousand-token list to each would multiply by the
+    batch size on a pass that runs over every absent verdict in the run.
+
+    Safe to withhold because of which way this pass can move a verdict. It only
+    takes a clause *off* absent when the reply quotes the design word for word
+    — so a clause whose breach turns on the stack stays absent and is reported
+    as absent. The block's absence cannot invent a breach here, only miss one,
+    and the whole-document reading that already saw the stack is the one that
+    was asked first.
+    """
     return "\n\n".join(
         f"[{index}] {clause['documentTitle']} — {clause['headingPath']}\n{_render_clause(clause)}"
         for index, clause in enumerate(clauses, start=1)
@@ -1628,7 +2123,8 @@ def _guard_document(
     evidence: list[dict],
     unverified: list[tuple[str, str]],
     fabricated: list[str],
-    conflicted: bool,
+    offered: int = 0,
+    conflicted: bool = False,
     clause_text: str = "",
 ) -> tuple[str, str]:
     """The same standard of proof as `_guard`, where the proof is a quote.
@@ -1664,6 +2160,7 @@ def _guard_document(
         cited_generated={item["chunkId"] for item in figures},
         cited_total=len(evidence),
         fabricated=fabricated,
+        offered=offered,
         conflicted=conflicted,
         clause_text=clause_text,
         figure_text=" ".join(str(item.get("excerpt") or "") for item in figures),
@@ -1734,6 +2231,7 @@ def _guard(
     cited_generated: set[str] | None = None,
     cited_total: int = 0,
     fabricated: list[str] | None = None,
+    offered: int = 0,
     conflicted: bool = False,
     clause_text: str = "",
     figure_text: str = "",
@@ -1776,12 +2274,42 @@ def _guard(
             )
 
     # A verdict resting on a decision nobody made is the register's version of
-    # citing a passage that is not in the document, and gets the same treatment.
+    # citing a passage that is not in the document. A verdict that also cites
+    # one is not the same thing, and used to get the same treatment: on one
+    # 170-clause run this demoted twenty findings, among them a contradiction
+    # carrying three verified quotes and the right answer.
+    #
+    # What made that unanimous rather than unlucky: the organisation had no
+    # standing decisions at all, so the model was handed an empty register and
+    # every id it named was "fabricated" by definition. It had named the
+    # design's own ADRs. A check that cannot not fire is not a check.
+    #
+    # So the citation is dropped and the verdict stands on its document
+    # evidence, which is what `_applied` already does with the stored ids.
+    #
+    # The demotion below is narrower than it looks: any citing verdict with no
+    # evidence has already returned at the top of this function, so what
+    # reaches it is an "absent" or a "needs_review" that cited a decision. For
+    # those the citation is the only thing that was ever offered, and there is
+    # nothing left to stand on once it goes.
     if fabricated:
-        return _demoted(
-            f"Reported '{verdict}' citing a standing decision that is not on record.",
-            rationale,
-        )
+        if not evidence:
+            return _demoted(
+                f"Reported '{verdict}' citing a standing decision that is not on record.",
+                rationale,
+            )
+        # Said out loud only when there was a register to get wrong. With none
+        # offered, the model had nothing to cite from and the slip says nothing
+        # about the verdict — noting it on every finding would be noise in the
+        # report and would read as a fault in the design.
+        if offered:
+            count = len(fabricated)
+            verdict, rationale = _noted(
+                verdict,
+                f"({count} cited standing decision{'s' if count != 1 else ''} "
+                "not on record, set aside.)",
+                rationale,
+            )
 
     # Two rulings pulling opposite ways, and deliberately not resolved by taking
     # the newer one — that would hide a contradiction the customer needs to fix.
@@ -1864,6 +2392,26 @@ def _demoted(reason: str, rationale: str) -> tuple[str, str]:
     return "needs_review", f"{reason} {tail}".strip()
 
 
+def _noted(verdict: str, note: str, rationale: str) -> tuple[str, str]:
+    """Keep the verdict; record the part of the answer that was set aside.
+
+    The counterpart to `_demoted`, and the distinction it draws is the whole
+    point: an unsupported *part* of an answer is not an unsupported answer. A
+    model that reads a design correctly, quotes it correctly, and then also
+    cites a standing decision nobody made has got one thing wrong and the
+    finding right. Throwing the finding away loses a real breach and teaches a
+    reviewer nothing; stripping the citation loses nothing at all.
+
+    The note trails the model's own reason rather than leading it, matching the
+    set-aside-quotes note in `_guard_document`: the verdict did not change, so
+    the reason it was reached still comes first.
+    """
+    note = _shorten(note, MAX_GUARD_REASON)
+    room = MAX_RATIONALE - len(note) - 1
+    body = _shorten(rationale, room) if room >= 40 else ""
+    return verdict, f"{body} {note}".strip()
+
+
 def _reclassified(verdict: str, reason: str, rationale: str) -> tuple[str, str]:
     """A demotion that knows the right answer, not just that this one is wrong.
 
@@ -1885,12 +2433,29 @@ def _reclassified(verdict: str, reason: str, rationale: str) -> tuple[str, str]:
 
 #: A remediation opens with an instruction. Checked on the rationale's last
 #: sentence, which the prompts reserve for the fix.
+# A closed list, and the cost of a gap in it falls the wrong way. A verb that
+# is missing turns a real fix into a "the two do not agree" demotion, and four
+# of five ordinary remediation sentences were failing it:
+#
+#     "Ensure the legacy console conforms to the MFA baseline."
+#     "Adopt MuleSoft so the design conforms to the integration standard."
+#     "Use KMS so the staging file meets the encryption requirement."
+#     "Update the ADR so it adheres to the exception process."
+#
+# Each pairs an imperative the list did not know with a phrase `_COMPLIANT_PROSE`
+# does. So err generous: a verb wrongly admitted only lets a finding keep the
+# wording the model gave it, which is where the engine started; a verb wrongly
+# missing rewrites a correct finding into a review item.
 _IMPERATIVE = re.compile(
     r"^\s*(?:Add|Replace|Remove|Define|Document|Specify|Route|Decouple|Split|Move|Set|"
     r"Enforce|Introduce|Restrict|Encrypt|Bound|Configure|Record|Obtain|Migrate|Separate|"
     r"Apply|Limit|Rename|Publish|Retire|Isolate|Pin|Scope|Require|Capture|Store|Rotate|"
     r"Terminate|Upgrade|Patch|Index|Partition|Cache|Throttle|Version|Validate|Review|"
-    r"Confirm|Raise|Agree|Ask)\b",
+    r"Confirm|Raise|Agree|Ask|"
+    r"Ensure|Adopt|Use|Update|Create|Establish|Extend|Enable|Disable|Assign|Nominate|"
+    r"Align|Consolidate|Centralise|Centralize|Standardise|Standardize|Provision|Deploy|"
+    r"Automate|Harden|Monitor|Instrument|Track|Schedule|Complete|Close|Plan|Fund|Grant|"
+    r"Revoke|Tighten|Reduce|Increase|Test|Verify|Reconcile|Formalise|Formalize)\b",
     re.IGNORECASE,
 )
 
@@ -2090,23 +2655,44 @@ def _normalise(
         verdict = "contradicts"
 
     # The model graded the clause as unmet and then wrote that the design meets
-    # it. Trusting the prose here, as the rule above does: a remediation
-    # sentence that argues compliance *is* the model's real answer, and the
-    # verdict label is what it picked before writing it out.
+    # it. A finding whose fix says there is nothing to fix is unusable and the
+    # contradiction is worth catching — but it used to be caught by trusting
+    # the prose and promoting the verdict to "covered".
     #
-    # Promoted to "covered" rather than left contradicting itself, because the
-    # alternative — a finding whose fix says there is nothing to fix — is
-    # unusable, and `_guard` still runs afterwards. That guard demotes any
-    # promoted verdict with no verified quote behind it, so this cannot invent
-    # a pass: it can only let one the model already argued for stand or be
-    # demoted on the evidence.
-    if _fix_is_a_compliance_claim(verdict, rationale):
+    # That was the wrong half to trust. The argument for it was that `_guard`
+    # runs afterwards and "demotes any promoted verdict with no verified quote
+    # behind it, so this cannot invent a pass". The gap in that reasoning is
+    # that the guard only catches an *unevidenced* promotion. A clause whose
+    # evidence quotes the design accurately and whose last sentence argues
+    # compliance sails through it.
+    #
+    # SEC-006 on a real run is what that looks like. The clause requires MFA
+    # for privileged access. The design says MFA is enforced for SSO, console
+    # and VPN, "Legacy operations console has username/password
+    # authentication" — quoted, verified, in the finding's own evidence. The
+    # rationale ended "This satisfies the clause's requirement", the verdict
+    # was promoted to covered, and a reviewer reading the report learned that
+    # an unprotected privileged console was compliant.
+    #
+    # The engine can tell the answer contradicts itself without knowing which
+    # half is right, so it says that and stops — the same reasoning, and the
+    # same landing place, as the paperwork check below.
+    # Not when the engine is the one that said "needs_review". `_NEEDS_REMEDIATION`
+    # includes it, and any unrecognised verdict field is mapped to it above — so
+    # without this the engine writes "Graded 'needs_review', then gave a reason
+    # arguing the design already complies" about a label it assigned itself, and
+    # changes no verdict in the process.
+    if verdict != "needs_review" and _fix_is_a_compliance_claim(verdict, rationale):
         logs.info(
             log,
-            "remediation sentence argued compliance; trusting the prose",
+            "remediation sentence argued compliance with the verdict it contradicts",
             was=verdict,
         )
-        verdict = "covered"
+        verdict, rationale = _demoted(
+            f"Graded '{verdict}', then gave a reason arguing the design already complies; "
+            "the two do not agree.",
+            rationale,
+        )
 
     # A technical clause answered with a complaint about paperwork. Sent to
     # needs_review rather than guessed: the engine can tell the answer is wrong
@@ -2178,12 +2764,125 @@ def _reference(clause: dict) -> str:
     return f"{base} › {tail}" if tail else base
 
 
-def _render_clause(clause: dict) -> str:
+def _refuse_without_credit(pending: int) -> None:
+    """Stop before the first clause when the key is already empty.
+
+    Dying halfway is the worst outcome this stage has. The credits are spent
+    either way, and what they bought is a third of a report — on one real run,
+    the third that happened to hold DAT and EA, while every clause that would
+    have decided the review sat in the two-thirds that never ran. Nobody can
+    act on that, and re-running pays for the first third again.
+
+    Unknown is not empty. Any provider that does not report a balance, and any
+    check that fails for its own reasons, returns None and the run proceeds —
+    refusing to start on a number nobody could read would be a worse failure
+    than the one this prevents.
+    """
+    # A resume with every clause already judged needs no model calls at all —
+    # only the finishing passes. Refusing it on an empty key would fail a run
+    # that was about to succeed for free, and take its coverage, advice and
+    # root-cause passes with it. That is the resume this check exists to
+    # protect, so it is the one case it must not touch.
+    if pending <= 0:
+        return
+    # The promise in the docstring, kept. `credit_remaining` guards its own
+    # HTTP call, but reaching it goes through `client()` and the bound
+    # credential, and anything raised there would fail the job before the run
+    # has even started.
+    try:
+        left = llm.credit_remaining()
+        if left is not None:
+            # Inside the try, deliberately. Only the OpenRouter implementation
+            # coerces its own figures; another provider could hand back a string
+            # or a Decimal, and the comparison below would raise outside this
+            # block and fail the job before the run had started — which is the
+            # one thing the docstring promises cannot happen.
+            left = float(left)
+    except Exception:  # noqa: BLE001 — a failed check must never fail a run
+        return
+    if left is None:
+        return
+    needed = pending * MIN_CREDIT_PER_CLAUSE
+    logs.info(
+        log,
+        "credit before the run",
+        remaining=round(left, 4),
+        clauses=pending,
+        leastNeeded=round(needed, 4),
+    )
+    # Not `left <= 0`. A balance can be positive and still nowhere near enough,
+    # which is the failure that keeps happening: the run starts, bills for a
+    # fraction of the framework, and stops somewhere arbitrary. The findings it
+    # did reach are the ones that happened to be judged first, not the ones
+    # worth having, and re-running pays for them again.
+    if left < needed:
+        raise llm.QuotaExhausted(
+            f"{credentials.whose()} has {round(left, 4)} left and this run needs at "
+            f"least {round(needed, 4)} for {pending} clauses; add credits and re-run"
+        )
+
+
+def _overrides_absent(verdict: str, evidence: list[dict]) -> bool:
+    """Whether a search second opinion is strong enough to unseat an "absent".
+
+    Decisive and cited, or it does not count. A whole-document read has seen
+    everything the search has and more, so the search earns its say only by
+    finding a passage that settles the clause — "covered", "contradicts", or
+    "not_applicable", which settles it just as firmly by showing the clause
+    does not govern this design. Not by hedging "partial" over eight chunks it
+    has no surrounding document for.
+    """
+    return verdict in DECISIVE_VERDICTS and bool(evidence)
+
+
+def _render_clause(clause: dict, *, with_force: bool = True, stack_block: str = "") -> str:
+    """The clause as the judge reads it.
+
+    `with_force=False` for the copy handed to the guards. They are given this
+    same string as `clause_text`, and `fidelity` tokenises it to decide whether
+    cited evidence is even on the clause's subject — so every word in here
+    becomes a word the evidence may match against.
+
+    The obligation line costs seven of them: how, strongly, clause, binds,
+    read, own, wording, none of which are in `fidelity._SUBJECT_STOP`. With it
+    included, a figure description reading "Diagram read by the team showing
+    how each service binds to its own queue" corroborated a cryptography
+    clause, because `_figure_corroborates` needs two shared keywords and
+    "read" and "binds" are two. A verdict resting on nothing but a diagram
+    stopped being demoted, which is the one thing that guard exists to do.
+
+    So the prompt gets the sentence and the guards get the clause.
+
+    `stack_block` rides on the same split, and for the same reason. It is the
+    organisation's technology stack, a thousand tokens of product names, and it
+    is attached only to clauses that are about what the stack approves — see
+    `stack.concerns_technology`. Handed to the guards it would be catastrophic:
+    `fidelity` tokenises this string to decide whether cited evidence is even on
+    the clause's subject, and two hundred technology names would corroborate
+    almost any extract from almost any design.
+    """
     parts = []
     if clause["title"]:
         parts.append(f"Title: {clause['title']}")
     if clause["statement"]:
         parts.append(f"Statement: {clause['statement']}")
+    # The clause's own force, stated once and stated always — not only where the
+    # parser recorded a strength per requirement.
+    #
+    # The block below prints those strengths, and prints nothing at all when the
+    # clause has no requirement rows. A clause read from a register workbook has
+    # none: its obligation lives in its statement. So on a run over six client
+    # registers this function never once told the judge which clauses were
+    # mandatory, across all 170 of them, while the prompt went on asking it to
+    # weigh exactly that.
+    #
+    # `obligations.of` is the same deterministic reading the finding is stored
+    # with, so the judge is told what the report will say rather than forming a
+    # second opinion. Printed only when it is known: an invented "must" is the
+    # one thing the brief forbids outright.
+    force = obligations.of(clause)
+    if with_force and force.is_known:
+        parts.append(f"How strongly this clause binds: {force.describe()}")
     if clause["requirements"]:
         # Each requirement with how strongly it binds. The parser has always
         # recorded this and nothing ever read it, so the judge could not tell a
@@ -2201,6 +2900,18 @@ def _render_clause(clause: dict) -> str:
     # Rationale and guidance are deliberately withheld: they explain why the
     # rule exists and how to implement it, and including them tempts the model
     # to mark a design down for not following advice the clause never required.
+    #
+    # The stack goes last, after the clause and its requirements, and is
+    # labelled as the organisation's record rather than as part of the standard.
+    # A clause says what must be true; this says what the organisation has
+    # approved. Printed above the clause they would read as one thing, and a
+    # judge would start quoting the stack as though the standard had said it.
+    if stack_block and stack.concerns_technology(clause):
+        parts.append(
+            "The organisation's own technology record, for this clause. These are "
+            "facts about what has been approved, not part of the standard above:\n"
+            + stack_block
+        )
     return "\n".join(parts)
 
 
@@ -2295,6 +3006,9 @@ def _write(
     applied: list[dict],
     judged_obligation: str = "",
     design_id: str | None = None,
+    readings: int = 1,
+    agreed: int = 1,
+    dissent: list[dict] | None = None,
 ) -> None:
     """One finding, committed on its own so a crash costs at most one clause."""
     reference = _reference(clause)
@@ -2310,8 +3024,9 @@ def _write(
                 ("id","runId","clauseId","documentId","designKey",
                  "clauseRef","clauseTitle","clauseStatement",
                  "verdict","confidence","rationale","evidence","retrievalScore",
-                 "appliedDecisions","obligation","obligationSource")
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                 "appliedDecisions","obligation","obligationSource",
+                 "readings","agreed","dissent")
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT ("runId","clauseId","designKey") DO UPDATE SET
                 "documentId" = EXCLUDED."documentId",
                 "verdict"    = EXCLUDED."verdict",
@@ -2321,7 +3036,10 @@ def _write(
                 "retrievalScore" = EXCLUDED."retrievalScore",
                 "appliedDecisions" = EXCLUDED."appliedDecisions",
                 "obligation" = EXCLUDED."obligation",
-                "obligationSource" = EXCLUDED."obligationSource"
+                "obligationSource" = EXCLUDED."obligationSource",
+                "readings" = EXCLUDED."readings",
+                "agreed" = EXCLUDED."agreed",
+                "dissent" = EXCLUDED."dissent"
             """,
             (
                 db.new_id(),
@@ -2340,6 +3058,9 @@ def _write(
                 Jsonb(applied),
                 obligation.strength,
                 obligation.source,
+                readings,
+                agreed,
+                Jsonb(dissent or []),
             ),
         )
 

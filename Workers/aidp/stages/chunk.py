@@ -51,6 +51,20 @@ _MIN_SECTION_PROSE = 320
 # solution deck is every slide that matters.
 _MIN_ORPHAN_PROSE = 60
 
+# How much rendered table a single "whole table" chunk may carry, in characters.
+#
+# Every embedding provider caps one input — OpenAI's text-embedding-3-* at 8192
+# tokens — and rejects the *entire batch* when one input is over it. A 215-row
+# technology-stack sheet rendered to one 52,000-character chunk, and the 400 it
+# came back with failed the whole index build for a document whose other 258
+# chunks were fine.
+#
+# Windowing the rows keeps what this chunk is for — "what does this table say",
+# asked of the table rather than of one of its rows — while bounding the input.
+# A window still carries the header line, so every cell stays bound to its
+# column name exactly as in the single-chunk case.
+_MAX_TABLE_CHARS = 12_000
+
 
 def handle(job: Job, heartbeat) -> None:
     with db.connection() as conn:
@@ -171,11 +185,18 @@ def _build(document, sections, clauses, table_blocks, figures) -> list[_Draft]:
                 )
             # Whole-table chunk as well, for questions about the table itself
             # ("what are the criticality tiers?") rather than one of its rows.
-            drafts.append(
-                _Draft("table", table["id"], path,
-                       f"{caption}\n\n{_render_table(columns, rows)}",
-                       table["pageStart"], table["pageEnd"])
-            )
+            # Split into row windows when the table is too large to embed as
+            # one input — see _MAX_TABLE_CHARS.
+            for body, first, last in _table_windows(columns, rows):
+                span = (
+                    "" if (first, last) == (1, len(rows))
+                    else f" (rows {first}–{last} of {len(rows)})"
+                )
+                drafts.append(
+                    _Draft("table", table["id"], path,
+                           f"{caption}{span}\n\n{body}",
+                           table["pageStart"], table["pageEnd"])
+                )
 
         for figure in figures.get(sid, []):
             # A rejected description was judged wrong by a person. Indexing it
@@ -245,11 +266,41 @@ def _render_row(columns: list[str], row: dict) -> str:
     return (f"{lead} — " if lead else "") + ". ".join(rest) + "."
 
 
-def _render_table(columns: list[str], rows: list[dict]) -> str:
-    out = [" | ".join(columns)]
-    for row in rows:
-        out.append(" | ".join((row.get(c) or "not specified") for c in columns))
-    return "\n".join(out)
+def _table_windows(
+    columns: list[str], rows: list[dict]
+) -> list[tuple[str, int, int]]:
+    """The table rendered as one chunk, or as several bounded ones.
+
+    Returns `(text, first_row, last_row)` with the row numbers 1-based, so the
+    caller can say which slice of the table a window is. Each window repeats
+    the header line: a window without it is a grid of values with nothing
+    saying what the columns mean.
+
+    A single row longer than the budget is still emitted on its own and
+    truncated — one unreadable tail is better than losing the row, and the
+    per-row chunk for it exists regardless.
+    """
+    header = " | ".join(columns)
+    lines = [" | ".join((row.get(c) or "not specified") for c in columns) for row in rows]
+
+    whole = "\n".join([header, *lines])
+    if len(whole) <= _MAX_TABLE_CHARS:
+        return [(whole, 1, len(rows))]
+
+    budget = _MAX_TABLE_CHARS - len(header) - 1
+    windows: list[tuple[str, int, int]] = []
+    current: list[str] = []
+    used = 0
+    start = 1
+    for index, line in enumerate(lines, start=1):
+        if current and used + len(line) + 1 > budget:
+            windows.append(("\n".join([header, *current]), start, index - 1))
+            current, used, start = [], 0, index
+        current.append(line[:budget])
+        used += len(current[-1]) + 1
+    if current:
+        windows.append(("\n".join([header, *current]), start, len(lines)))
+    return windows
 
 
 def _document_text(sections: list[dict]) -> str:

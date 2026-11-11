@@ -194,14 +194,23 @@ _BACKOFF = """
 """
 
 
-def fail(job: Job, error: str) -> str:
-    """Release a job after a handler raised. Returns its new state."""
+def fail(job: Job, error: str, *, fatal: bool = False) -> str:
+    """Release a job after a handler raised. Returns its new state.
+
+    `fatal` dead-letters on the spot. Backoff exists for a failure that time
+    might fix — a rate limit, a dropped connection, a provider having a bad
+    minute — and retrying one it cannot only delays the report and buries the
+    reason under four more copies of itself. An exhausted model key is the
+    clear case: it will still be exhausted in two, four, eight and sixteen
+    seconds. One analyse job recorded five attempts against the same
+    "QuotaExhausted" before anyone was told.
+    """
     with db.connection() as conn:
         row = db.one(
             conn,
             f"""
             UPDATE "job"
-               SET "state" = CASE WHEN "attempts" >= "maxAttempts"
+               SET "state" = CASE WHEN %(fatal)s OR "attempts" >= "maxAttempts"
                                   THEN 'dead' ELSE 'queued' END,
                    {_BACKOFF},
                    "leaseUntil" = NULL,
@@ -211,7 +220,12 @@ def fail(job: Job, error: str) -> str:
              WHERE "id" = %(id)s
             RETURNING "state", "attempts"
             """,
-            {"id": job.id, "err": error[:4000], "cap": MAX_BACKOFF_SECONDS},
+            {
+                "id": job.id,
+                "err": error[:4000],
+                "cap": MAX_BACKOFF_SECONDS,
+                "fatal": fatal,
+            },
         )
     state = row["state"] if row else "unknown"
     if state == "dead":

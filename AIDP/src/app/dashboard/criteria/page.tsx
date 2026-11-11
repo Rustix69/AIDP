@@ -77,6 +77,9 @@ export default async function CriteriaPage() {
         eyebrow="Governance"
         title="Significance criteria"
         lede="What makes a request architecturally significant. Any one of these triggering sends it to a person; none triggering lets it through on the findings alone."
+        meta={`${view.filter((criterion) => criterion.active).length} of ${
+          view.length
+        } categories checked${canEdit ? "" : " · read-only"}`}
       />
 
       {!canEdit && (

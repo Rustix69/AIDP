@@ -22,7 +22,11 @@ import type { OrganisationActivity, PersonWork, Tone, WorkEvent } from "@/lib/ac
 const TONE: Record<Tone, string> = {
   good: "border-ok-line bg-ok-tint text-ok",
   bad: "border-danger-line bg-danger-tint text-danger",
-  working: "border-sky-300 bg-sky-600/[0.08] text-sky-700",
+  // The accent's own rungs, not Tailwind's `sky`. This was the one chip in
+  // the product painted outside the token set, so "in progress" came out a
+  // different blue here than everywhere else — and it did not answer the
+  // theme switch at all.
+  working: "border-royal-mid/40 bg-royal-tint text-royal-deep",
   waiting: "border-warn-line bg-warn-tint text-warn",
   neutral: "border-line bg-card text-ink/68",
 };

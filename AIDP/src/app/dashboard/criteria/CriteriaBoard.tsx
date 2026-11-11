@@ -4,6 +4,7 @@ import { useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import { AlertTriangle, RotateCcw } from "lucide-react";
 import { cn } from "@/lib/cn";
+import { Toggle } from "@/components/ui/Toggle";
 import { restore, setActive, setThreshold } from "./actions";
 
 /**
@@ -116,122 +117,134 @@ export function CriteriaBoard({
       )}
 
       <p className="mb-4 text-[12.5px] text-ink/60">
-        {criteria.length - off.length} of {criteria.length} categories are checked on every
-        submission. Any one of them triggering makes a request architecturally significant.
+        Any one of these triggering makes a request architecturally significant.
       </p>
 
-      <ul className="grid gap-2">
-        {criteria.map((criterion) => (
-          <li
-            key={criterion.id}
-            className={cn(
-              "rounded-xl border bg-card px-4 py-3",
-              criterion.active ? "border-line" : "border-dashed border-line opacity-70",
-            )}
-          >
-            <div className="flex items-start justify-between gap-3">
-              <div className="min-w-0">
-                <p className="text-[13.5px] font-medium text-ink">{criterion.label}</p>
-                <p className="mt-0.5 text-[12px] text-ink/60">{criterion.description}</p>
+      {/* One panel with a rule between each category, which is how the
+          client's prototype draws this screen — a list of switches reads as a
+          settings sheet, where a grid of separate cards reads as nine
+          unrelated things. The switch leads the row because it is the state
+          the eye is scanning for; the name and the condition follow it. */}
+      <div className="overflow-hidden rounded-2xl border border-line bg-card shadow-card">
+        <ul>
+          {criteria.map((criterion) => (
+            <li
+              key={criterion.id}
+              className={cn(
+                "flex items-start gap-4 border-b border-line px-5 py-4 last:border-b-0",
+                !criterion.active && "bg-canvas-sunk/40",
+              )}
+            >
+              <div className="pt-0.5">
+                <Toggle
+                  checked={criterion.active}
+                  disabled={pending || !canEdit}
+                  label={`Check ${criterion.label} on every submission`}
+                  onChange={(next) => act(() => setActive(criterion.id, next))}
+                />
               </div>
 
-              <button
-                type="button"
-                disabled={pending || !canEdit}
-                onClick={() => act(() => setActive(criterion.id, !criterion.active))}
-                className={cn(
-                  "shrink-0 rounded-full border px-3 py-1 text-[11.5px] transition-colors",
-                  canEdit ? "cursor-pointer" : "cursor-default",
-                  "disabled:opacity-50",
-                  criterion.active
-                    ? "border-royal-mid/40 bg-royal/8 text-royal"
-                    : "border-line text-ink/55",
-                )}
-              >
-                {criterion.active ? "Checked" : "Not checked"}
-              </button>
-            </div>
-
-            <ul className="mt-2 space-y-1 border-t border-line pt-2">
-              {criterion.conditions.map((condition, index) => (
-                <li key={index} className="flex flex-wrap items-center gap-2">
-                  <span
-                    className={cn(
-                      "text-[12.5px]",
-                      condition.problem ? "text-warn" : "text-ink/75",
-                    )}
-                  >
-                    {condition.problem ?? condition.text}
-                  </span>
-
-                  {condition.threshold !== null && canEdit && (
-                    editing === `${criterion.id}:${index}` ? (
-                      <span className="inline-flex items-center gap-1">
-                        <input
-                          value={draft}
-                          autoFocus
-                          onChange={(event) => setDraft(event.target.value)}
-                          className="w-36 rounded-lg border border-line bg-canvas-sunk px-2 py-0.5 text-[12.5px] text-ink focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-royal-mid"
-                        />
-                        <button
-                          type="button"
-                          disabled={pending}
-                          onClick={() => act(() => setThreshold(criterion.id, index, draft))}
-                          className="rounded-full bg-royal px-3 py-0.5 text-[11.5px] font-medium text-white cursor-pointer disabled:opacity-50"
-                        >
-                          Save
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => setEditing(null)}
-                          className="rounded-full px-2 py-0.5 text-[11.5px] text-ink/60 hover:text-ink cursor-pointer"
-                        >
-                          Cancel
-                        </button>
-                      </span>
-                    ) : (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setEditing(`${criterion.id}:${index}`);
-                          setDraft(String(condition.threshold));
-                        }}
-                        className="rounded-full border border-line px-2.5 py-0.5 text-[11.5px] text-ink/70 hover:text-ink cursor-pointer"
-                      >
-                        Change
-                      </button>
-                    )
+              <div className="min-w-0 flex-1">
+                <p
+                  className={cn(
+                    "text-[13.5px] font-semibold",
+                    criterion.active ? "text-ink" : "text-ink/58",
                   )}
-                </li>
-              ))}
-            </ul>
-          </li>
-        ))}
-      </ul>
+                >
+                  {criterion.label}
+                  {!criterion.active && (
+                    <span className="ml-2 text-[11.5px] font-normal text-ink/50">
+                      not checked
+                    </span>
+                  )}
+                </p>
 
-      <div className="mt-5 flex items-center justify-between gap-3">
-        <div className="min-w-0">
-          {message && (
-            <p
-              role="status"
-              className={cn("text-[12.5px]", message.ok ? "text-ok" : "text-warn")}
+                <ul className="mt-1 space-y-1.5">
+                  {criterion.conditions.map((condition, index) => (
+                    <li key={index} className="flex flex-wrap items-center gap-2">
+                      <span
+                        className={cn(
+                          "text-[12.5px] leading-relaxed",
+                          condition.problem ? "text-warn" : "text-ink/65",
+                        )}
+                      >
+                        {condition.problem ?? condition.text}
+                      </span>
+
+                      {condition.threshold !== null && canEdit && (
+                        editing === `${criterion.id}:${index}` ? (
+                          <span className="inline-flex items-center gap-1.5">
+                            <input
+                              value={draft}
+                              autoFocus
+                              aria-label={`Threshold for ${criterion.label}`}
+                              onChange={(event) => setDraft(event.target.value)}
+                              className="w-32 rounded-md border border-line bg-canvas-sunk px-2.5 py-1 text-[12.5px] text-ink focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-royal-mid"
+                            />
+                            <button
+                              type="button"
+                              disabled={pending}
+                              onClick={() => act(() => setThreshold(criterion.id, index, draft))}
+                              className="rounded-full bg-royal px-3 py-1 text-[11.5px] font-semibold text-white disabled:opacity-50"
+                            >
+                              Save
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setEditing(null)}
+                              className="rounded-full px-2 py-1 text-[11.5px] text-ink/58 hover:text-ink"
+                            >
+                              Cancel
+                            </button>
+                          </span>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setEditing(`${criterion.id}:${index}`);
+                              setDraft(String(condition.threshold));
+                            }}
+                            className="rounded-full border border-line px-2.5 py-0.5 text-[11.5px] font-medium text-ink/70 transition-colors hover:border-line-strong hover:text-ink"
+                          >
+                            Change threshold
+                          </button>
+                        )
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            </li>
+          ))}
+        </ul>
+
+        <div className="flex flex-wrap items-center justify-between gap-3 border-t border-line bg-canvas-sunk/50 px-5 py-3.5">
+          <p className="text-[12px] text-ink/58">
+            {criteria.length - off.length} of {criteria.length} categories are checked on
+            every submission.
+          </p>
+          {canEdit && (
+            <button
+              type="button"
+              disabled={pending}
+              onClick={() => act(restore)}
+              className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-line bg-card px-3.5 py-1.5 text-[12.5px] text-ink/75 transition-colors hover:border-line-strong hover:text-ink disabled:opacity-50"
             >
-              {message.text}
-            </p>
+              <RotateCcw size={13} aria-hidden="true" />
+              Restore the defaults
+            </button>
           )}
         </div>
-        {canEdit && (
-          <button
-            type="button"
-            disabled={pending}
-            onClick={() => act(restore)}
-            className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-line px-4 py-1.5 text-[13px] text-ink/75 hover:text-ink cursor-pointer disabled:opacity-50"
-          >
-            <RotateCcw size={14} aria-hidden="true" />
-            Restore the defaults
-          </button>
-        )}
       </div>
+
+      {message && (
+        <p
+          role="status"
+          className={cn("mt-3 text-[12.5px]", message.ok ? "text-ok" : "text-warn")}
+        >
+          {message.text}
+        </p>
+      )}
     </>
   );
 }

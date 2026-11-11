@@ -28,11 +28,15 @@ const finding = (id: string, verdict: string, confidence: number, evidence: unkn
   clauseTitle: `Clause ${id}`,
   clauseStatement: "The design must do it.",
   verdict,
+  obligation: "unstated",
   confidence,
   rationale: "Because.",
   evidence,
   reviewerState: "pending",
   reviewerVerdict: null,
+  reviewerObligation: null,
+  reviewerSeverity: null,
+  reviewerRationale: null,
 });
 
 const run: CompletedRun = {
@@ -74,6 +78,37 @@ ok("evidence is narrowed, keeping only well-formed passages", result.findings[0]
 ok("coverage is read, gaps and suggestions intact", result.coverage?.gaps.length === 1 && result.coverage.suggestions.length === 1, result.coverage);
 ok("framework, mode and finish time are carried", result.frameworkName === "Data Standards" && result.frameworkVersion === 2 && result.mode === "document" && result.completedAt?.toISOString() === "2026-09-15T10:00:00.000Z");
 ok("not superseded unless told so", result.superseding === false && designResult(run, true).superseding === true);
+
+console.log("\nA finding a reviewer corrected");
+// The read-only twin of the report has to agree with it. A verdict corrected on
+// the design's own page must be the verdict this panel lists, counts and orders
+// by — the alternative is one clause reading two ways on two screens.
+const corrected = designResult({
+  ...run,
+  findings: [
+    { ...finding("p", "contradicts", 0.9), reviewerVerdict: "covered" },
+    { ...finding("q", "covered", 0.9), reviewerRationale: "Actually it is not met." },
+    // Corrected to a verdict this panel does not list: it drops out, exactly as
+    // an engine "absent" does.
+    { ...finding("r", "partial", 0.9), reviewerVerdict: "absent" },
+  ],
+});
+ok(
+  // Two: the one corrected to covered, and the one that already was.
+  "a corrected verdict is the one listed and counted",
+  corrected.counts.covered === 2 && corrected.counts.contradicts === 0,
+  corrected.counts,
+);
+ok(
+  "a corrected rationale is the one shown",
+  corrected.findings.find((f) => f.id === "q")?.rationale === "Actually it is not met.",
+  corrected.findings.find((f) => f.id === "q")?.rationale,
+);
+ok(
+  "a correction out of the listed set drops the finding",
+  corrected.findings.every((f) => f.id !== "r"),
+  corrected.findings.map((f) => f.id),
+);
 
 console.log("\nAn older run");
 const older = designResult({ ...run, coverage: null, findings: [finding("x", "absent", 0.9)] });

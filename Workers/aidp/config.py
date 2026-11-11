@@ -107,6 +107,51 @@ class Config:
     # the two readings disagree about are put in front of a reviewer. One
     # halves the cost and loses that check.
     rules_readings: int = 2
+    # How many times each clause is judged before a verdict is written.
+    #
+    # One reading is one opinion, and a model does not hold the same opinion
+    # twice: two runs over one design have come back 9 absent and 4 needing
+    # review, then 7 and 7. On an assessment somebody takes to an architecture
+    # board that is the whole credibility of the thing — a reviewer who runs it
+    # again on Thursday to show their manager, and is shown a different report,
+    # stops believing either one.
+    #
+    # So a clause is read more than once and the readings are voted on, which
+    # is what `coverage_reads` already does for the parts of a design no clause
+    # governs, and for the same reason. Readings stop early when they agree, so
+    # the common case costs two and only a genuinely contested clause costs
+    # three. 1 turns voting off and restores the single-reading behaviour.
+    # See `_vote` in stages/analyse.py.
+    judge_readings: int = 3
+    # How many clauses are judged at once.
+    #
+    # Each clause is an independent question, committed in its own transaction,
+    # and the loop that asked them was strictly sequential: at roughly fifteen
+    # seconds a clause, a hundred-and-twenty-clause framework took half an hour
+    # of a reviewer's afternoon, and a project of three designs took ninety
+    # minutes. Nothing about the work needed that — it was waiting on one
+    # provider call at a time.
+    #
+    # The ceiling is the provider's rate limit rather than this machine: the
+    # work is entirely I/O. Keep it under the database pool (`DB_POOL_MAX`,
+    # which is sized from this) and under whatever the key allows. 1 restores
+    # the sequential loop.
+    assess_concurrency: int = 8
+    # Whether a run that was not told how to read the design reads it whole
+    # when it fits, rather than by search.
+    #
+    # Search shows the judge the eight passages it ranked closest to a clause,
+    # and the dominant failure of an assessment is the clause whose answer was
+    # on page 23 and did not make that window: the report says "not addressed"
+    # about something the design plainly addresses, which is the single fastest
+    # way to lose a reviewer's trust. Reading the document whole cannot make
+    # that mistake, checks every quote word for word, and is what the
+    # provider's prompt cache makes affordable.
+    #
+    # Only for a run whose mode is "auto" — a reviewer who explicitly asked for
+    # search gets search. A single design that will not fit the token budget
+    # falls back and says so in the run's note. See `_resolve_mode`.
+    prefer_whole_document: bool = True
     # The largest document a whole-document assessment reads at once, in
     # tokens. Above it the run falls back to search and says so. Well inside
     # the model's context; the ceiling is cost, since every clause of a run
@@ -219,6 +264,10 @@ class Config:
             rules_by_model=os.environ.get("RULES_BY_MODEL", "on").lower()
             not in ("0", "off", "false", "no"),
             rules_readings=max(1, min(2, _int("RULES_READINGS", 2))),
+            judge_readings=max(1, min(5, _int("JUDGE_READINGS", 3))),
+            assess_concurrency=max(1, min(32, _int("ASSESS_CONCURRENCY", 8))),
+            prefer_whole_document=os.environ.get("PREFER_WHOLE_DOCUMENT", "on").lower()
+            not in ("0", "off", "false", "no"),
             whole_document_max_tokens=max(1_000, _int("WHOLE_DOCUMENT_MAX_TOKENS", 250_000)),
             coverage_reads=max(1, min(5, _int("COVERAGE_READS", 3))),
             improvement_suggestions=os.environ.get("IMPROVEMENT_SUGGESTIONS", "on").lower()

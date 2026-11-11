@@ -184,7 +184,7 @@ ok("new project runs snapshot the relationship", "designRelationship: project.de
 # What must keep holding:
 ok(
     "evidence still carries the design it came from",
-    '"documentId": c.document_id' in inspect.getsource(analyse._judge_by_search),
+    '"documentId": c.document_id' in inspect.getsource(analyse._judged_from),
 )
 ok(
     "each design is still searched in its own window",
@@ -193,6 +193,14 @@ ok(
 ok(
     "and the extracts are labelled per design for a project run",
     "named=len(scope.designs) > 1" in inspect.getsource(analyse._judge_by_search),
+)
+# Reading a clause more than once must not let the readings differ in what they
+# were shown. The search runs once and every reading is handed the same
+# candidates, so a vote is between judgements and never between retrievals.
+ok(
+    "every reading of a clause sees the same retrieved passages",
+    inspect.getsource(analyse._judge_by_search).index("candidates = retrieval.search")
+    < inspect.getsource(analyse._judge_by_search).index("def once("),
 )
 
 

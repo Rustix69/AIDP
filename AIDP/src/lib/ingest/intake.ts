@@ -240,6 +240,10 @@ export async function record(input: {
   fileName: string;
   format: Format;
   storageKey?: string;
+  /** Set only by `seedStandardLibrary`: which register of the product's own
+   *  baseline library this copy is. An upload never passes it, which is what
+   *  keeps "ours" and "theirs" distinguishable without a second intake path. */
+  suppliedKey?: string;
 }): Promise<Recorded> {
   const { organisationId, userId, role, projectId, bytes, fileName, format } = input;
   const hash = sha256(bytes);
@@ -277,6 +281,7 @@ export async function record(input: {
         organisationId,
         role,
         projectId,
+        suppliedKey: input.suppliedKey ?? null,
         title: title.slice(0, 500),
         storageKey: key,
         mimeType: format.mimeType,

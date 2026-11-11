@@ -224,6 +224,19 @@ Rules that matter:
    writing the gap, name the clause's own subject in one word and check the gap is
    about that. If the design falls short on something this clause does not govern,
    leave it out: the coverage pass and the suggestions exist for exactly that.
+3b-ii. Read the whole extract before answering "covered". A design states a rule and
+   its exception in one breath: the second half of the same sentence, the next column
+   of the same table row, the line after the one you were about to cite. "MFA is
+   enforced for corporate SSO, AWS console and remote VPN. Legacy operations console
+   has username/password authentication." "Catalog service is the system of record.
+   Merchandising also maintains a spreadsheet that may supersede service values." Both
+   of those say the design complies and then name where it does not. Following a rule
+   everywhere except one named system does not meet a clause that says must: that is
+   "partial" where the clause allows a documented exception, and "contradicts" where
+   it allows none. Cite the exception as well as the rule. If the extract you were
+   about to offer as proof of compliance also contains a "but", an "except", a
+   "legacy", a "manual", a "not enabled" or any named carve-out, that half is the one
+   the reviewer needs.
 3c. A document that does not say is not a document that breaches. This is the
    rule that matters most here. Where the clause turns on a record the design
    would not normally contain — an approval, a waiver, a signed exception, a
@@ -490,6 +503,7 @@ class LLM(Protocol):
         document: str = "",
         designs: int = 1,
         alternatives: bool = False,
+        reading: int = 0,
     ) -> dict: ...
     def structure(
         self, *, numbered: str, first_line: int, last_line: int, tags: str = ""
@@ -498,7 +512,8 @@ class LLM(Protocol):
         self, *, document: str, title: str, first: int, last: int, whole: bool, attempt: int
     ) -> str: ...
     def judge_document(
-        self, *, document: str, reference: str, clause: str, precedents: str = ""
+        self, *, document: str, reference: str, clause: str, precedents: str = "",
+        reading: int = 0,
     ) -> dict: ...
     def find_uncovered(self, *, design: str, standards: str, title: str) -> dict: ...
     def suggest_improvements(
@@ -506,6 +521,7 @@ class LLM(Protocol):
     ) -> dict: ...
     def sharpen_clause(self, *, clause: str, finding: str, evidence: str) -> dict: ...
     def find_technologies(self, *, design: str, products: str, title: str) -> dict: ...
+    def read_intake(self, *, designs: str, questions: str) -> dict: ...
     def confirm_absent(self, *, document: str, clauses: str) -> dict: ...
     def group_findings(self, *, findings: str) -> dict: ...
 
@@ -781,6 +797,11 @@ _VERDICT_SCHEMA = {
         "verdict",
         "confidence",
         "rationale",
+        # Declared in `properties` above but left out of these two lists, which
+        # on the Gemini path — where this dict is passed through as
+        # `responseSchema` verbatim — let the model omit it and the clause fall
+        # back to "unstated". Listed here so both providers must answer it.
+        "obligation",
         "evidence",
         "appliedDecisions",
         "breach",
@@ -790,6 +811,7 @@ _VERDICT_SCHEMA = {
         "verdict",
         "confidence",
         "rationale",
+        "obligation",
         "evidence",
         "appliedDecisions",
         "breach",
@@ -935,6 +957,12 @@ _RULES_SCHEMA = {
                     "references": _LINES,
                 },
                 "required": [
+                    # Nullable, and still required: a rule under no heading
+                    # answers null rather than leaving the field out. Omitting
+                    # it here made the providers disagree — `_strict_schema`
+                    # requires every declared property on the OpenAI path, so
+                    # only Gemini treated it as optional.
+                    "heading",
                     "from",
                     "to",
                     "statement",
@@ -964,6 +992,28 @@ _RULES_SCHEMA = {
 # Well inside both providers' output limits, and far above what a part of
 # `rules.MAX_LINES_PER_CALL` lines needs.
 _RULES_MAX_TOKENS = 32_000
+
+
+#: How independent a judge reading is from the one before it.
+#:
+#: The same reasoning as `_rules_temperature`, applied to the verdict. A clause
+#: is judged more than once so that the readings can be voted on (see `_vote` in
+#: stages/analyse.py), and a vote is only worth taking when the readings are
+#: genuinely separate opinions. At temperature 0 with the seed held still they
+#: are one opinion billed three times: the model makes the same mistake each
+#: round and their agreeing proves nothing.
+#:
+#: So the first reading stays deterministic — it is the one a single-reading run
+#: would have produced, and holding it still keeps the common case reproducible
+#: — and every reading after it is sampled, on its own seed.
+JUDGE_SAMPLED_TEMPERATURE = 0.4
+
+
+def judge_sampling(reading: int) -> tuple[float, int]:
+    """(temperature, seed) for reading number `reading`, counting from 0."""
+    if reading <= 0:
+        return 0.0, _SEED
+    return JUDGE_SAMPLED_TEMPERATURE, _SEED + reading
 
 
 def _rules_temperature(attempt: int) -> float:
@@ -1042,6 +1092,21 @@ it and the clause it does belong to goes unassessed. Before writing the gap, nam
 the clause's own subject in one word and check the gap is about that. If the design \
 falls short on something this clause does not govern, leave it out: the coverage \
 pass and the suggestions exist for exactly that.
+3a-ii. Read to the end of the passage before answering "covered". A design states a \
+rule and its exception in one breath: the second half of the same sentence, the next \
+column of the same table row, the line after the one you were about to quote. "MFA is \
+enforced for corporate SSO, AWS console and remote VPN. Legacy operations console has \
+username/password authentication." "Catalog service is the system of record. \
+Merchandising also maintains a spreadsheet that may supersede service values." Both of \
+those say the design complies and then name where it does not. Following a rule \
+everywhere except one named system does not meet a clause that says must: that is \
+"partial" where the clause allows a documented exception, and "contradicts" where it \
+allows none. Quote the exception as well as the rule. You have the whole document, so \
+this is a check you can actually perform: having found the passage that answers the \
+clause, read the rest of its sentence, its row and its section before you grade it. If \
+the passage you were about to offer as proof of compliance also contains a "but", an \
+"except", a "legacy", a "manual", a "not enabled" or any named carve-out, that half is \
+the one the reviewer needs.
 4. A quote must bear on what the clause requires. A passage about a neighbouring \
 subject is not partial compliance: authentication quoted for an encryption clause, or \
 logging quoted for an access-control clause, meets none of it. If nothing in the \
@@ -1235,6 +1300,17 @@ _DOCUMENT_VERDICT_SCHEMA = {
         },
         "confidence": {"type": "number"},
         "rationale": {"type": "string"},
+        # Named in `required` and `propertyOrdering` below, so it has to be
+        # declared here or it cannot be answered: `_strict_schema` rebuilds
+        # `required` from `properties`, and a field missing here is dropped
+        # from the request entirely rather than rejected. It went missing for
+        # exactly that reason, and every finding from a whole-document run came
+        # back "unstated" — severity then had nothing to weigh, because
+        # `severityOf` grades on (verdict, obligation) and nothing else.
+        "obligation": {
+            "type": "string",
+            "enum": ["must", "should", "may", "unstated"],
+        },
         "evidence": {
             "type": "array",
             "items": {
@@ -1798,9 +1874,39 @@ honest answer when the clause is already specific.
 8. "note" is a single sentence, at most 200 characters, saying what the clause left \
 unsaid. It is the case for the change, shown to the person who approves it. Not a \
 restatement of the requirements.
+
+Then the entry itself. Where this library is kept as a register, every rule in it \
+is a row with a reference, a category, an owner, a title, a statement and a \
+rationale — and a proposal that arrives as three loose sentences cannot be filed \
+beside them. The reference, the category and the owner are not yours to choose: \
+they are facts about where this rule sits, and they are filled in for you. Write \
+the three that are prose, in "entry":
+
+9. "entry.title" names the rule in at most 80 characters, in the register's voice \
+— a noun phrase, like the title shown above, not a sentence and not a restatement \
+of a requirement. "Layered Data Architecture", not "Consumers must not read raw \
+data".
+10. "entry.statement" is what the rule requires, in one or two sentences, binding \
+on every design. It obeys rules 1, 2 and 5 exactly as a requirement line does: \
+"must" or "must not", no product or project names, none of the banned words. This \
+is the sentence a reader of the register sees first, so it must stand on its own \
+without the requirement lines under it.
+11. "entry.rationale" is at most 240 characters saying why the rule exists — the \
+consequence it prevents, not a repetition of the statement. "A consumer reading \
+the raw layer is coupled to an upstream schema nobody agreed to keep stable", not \
+"Consumers must use the curated layer".
+
+These three describe a rule that could stand *beside* the clause above as its own \
+row in the register. You are still not rewriting the clause's own statement or \
+rationale — rule 4 holds. If the missing part belongs inside the existing rule \
+rather than in a new one, still fill these in: the person deciding reads both and \
+picks.
 """
 
-_SHARPEN_USER = "Write the requirement lines this clause was missing."
+_SHARPEN_USER = (
+    "Write the requirement lines this clause was missing, and the register entry "
+    "they belong to."
+)
 
 _SHARPEN_SCHEMA = {
     "type": "object",
@@ -1818,9 +1924,23 @@ _SHARPEN_SCHEMA = {
             },
         },
         "note": {"type": "string"},
+        # The prose of the register row this would become. The reference, the
+        # category and the owner are deliberately absent: those are facts about
+        # where the rule sits, filled in from the clause it came from, and a
+        # model asked for an identifier invents one that collides.
+        "entry": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "statement": {"type": "string"},
+                "rationale": {"type": "string"},
+            },
+            "required": ["title", "statement", "rationale"],
+            "propertyOrdering": ["title", "statement", "rationale"],
+        },
     },
-    "required": ["requirements", "note"],
-    "propertyOrdering": ["requirements", "note"],
+    "required": ["requirements", "note", "entry"],
+    "propertyOrdering": ["requirements", "note", "entry"],
 }
 
 _SHARPEN_MAX_TOKENS = 4096
@@ -1950,6 +2070,109 @@ def lifecycle_prompt_identity() -> str:
             _LIFECYCLE_USER,
             json.dumps(_LIFECYCLE_SCHEMA, sort_keys=True),
             str(_LIFECYCLE_MAX_TOKENS),
+        )
+    )
+
+
+_INTAKE_SYSTEM = """\
+You are reading the design documents submitted with an architecture review \
+request, to fill in the request form's structured questions from what the \
+designs already say. You do not judge the design and you do not advise on it.
+
+The designs are below, section by section. Each section starts with a line like \
+"=== D2/S12: 3.4 Backup (page 40) ===", where D2 is the design and S12 is the \
+section. Refer to a section only by that whole "D2/S12" label.
+
+<designs>
+{designs}
+</designs>
+
+The questions. Each begins with "field:" naming the field to answer it under, \
+then what it asks for and how to answer it:
+
+<questions>
+{questions}
+</questions>
+
+Answer only the questions these designs actually answer.
+
+Rules:
+1. "field" is the name after "field:" in the list above, copied exactly and \
+nothing else — not the words after it, not the question, not a tidied-up \
+version. One answer per field, and never a field that is not on the list.
+2. "value" is always a list of strings, whatever the question. The answer, in \
+the design's own terms:
+   - for a list field, the items, each a short name as the design writes it;
+   - for a text field, one or two plain sentences that a reviewer could read \
+instead of the design, naming what the design names;
+   - for a yes/no field, one item naming the thing the design says is new, is \
+being replaced, or is being duplicated — or an empty list if the design says it \
+happens without naming what.
+A text answer is one item, not a sentence per item.
+3. Never answer a yes/no field at all unless the design states it outright. A \
+design that does not mention replacing anything is not a design that replaces \
+nothing — it is a design that did not say, and leaving the field out is how you \
+say that. Only "yes" answers exist here; there is no way to answer "no" and you \
+must not try.
+4. "section" is the "D2/S12" label of the section your answer comes from.
+5. "quote" is that section's own words, copied exactly: a whole sentence, table \
+row or line that shows the answer. It is checked word for word against that \
+section, and an answer whose quote is not there is thrown away. Never join words \
+from separate places and never tidy up the design's wording.
+6. Leave out any question the designs do not answer. A question with no answer \
+in the designs is asked of the requestor instead, which is the right outcome; a \
+guess dressed as a reading is not. Do not infer an answer from what a solution \
+of this kind usually does, from the technologies named, or from the document's \
+title.
+7. Every value is a fact copied or summarised from the designs, never a \
+judgement and never a recommendation. No "consider", no "should", no note on \
+whether the design is any good. These answers go into a form a person signs.
+"""
+
+_INTAKE_USER = "Fill in the questions these designs answer."
+
+_INTAKE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "answers": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "field": {"type": "string"},
+                    "value": {"type": "array", "items": {"type": "string"}},
+                    "section": {"type": "string"},
+                    "quote": {"type": "string"},
+                    "page": {"type": "integer", "nullable": True},
+                },
+                "required": ["field", "value", "section", "quote", "page"],
+                "propertyOrdering": ["field", "value", "section", "quote", "page"],
+            },
+        },
+    },
+    "required": ["answers"],
+    "propertyOrdering": ["answers"],
+}
+
+_INTAKE_MAX_TOKENS = 8192
+
+
+def _intake_system(*, designs: str, questions: str) -> str:
+    return _INTAKE_SYSTEM.format(designs=designs, questions=questions)
+
+
+def intake_prompt_identity() -> str:
+    """Everything about the intake request except the designs themselves.
+
+    Part of the cache key for a reading (see request_intake.py), so a reworded
+    prompt retires every reading the old wording produced.
+    """
+    return "\x00".join(
+        (
+            _INTAKE_SYSTEM,
+            _INTAKE_USER,
+            json.dumps(_INTAKE_SCHEMA, sort_keys=True),
+            str(_INTAKE_MAX_TOKENS),
         )
     )
 
@@ -2263,7 +2486,9 @@ class GeminiLLM:
         document: str = "",
         designs: int = 1,
         alternatives: bool = False,
+        reading: int = 0,
     ) -> dict:
+        temperature, _ = judge_sampling(reading)
         text = self._generate(
             [
                 {
@@ -2280,6 +2505,7 @@ class GeminiLLM:
             system=None,
             max_tokens=2048,
             schema=_VERDICT_SCHEMA,
+            temperature=temperature,
         )
         if not text:
             raise RuntimeError("gemini returned an empty verdict")
@@ -2332,16 +2558,19 @@ class GeminiLLM:
         return text
 
     def judge_document(
-        self, *, document: str, reference: str, clause: str, precedents: str = ""
+        self, *, document: str, reference: str, clause: str, precedents: str = "",
+        reading: int = 0,
     ) -> dict:
         system, user = _document_judge_messages(
             document=document, reference=reference, clause=clause, precedents=precedents
         )
+        temperature, _ = judge_sampling(reading)
         text = self._generate(
             [{"text": user}],
             system=system,
             max_tokens=2048,
             schema=_DOCUMENT_VERDICT_SCHEMA,
+            temperature=temperature,
         )
         if not text:
             raise RuntimeError("gemini returned an empty verdict")
@@ -2380,6 +2609,17 @@ class GeminiLLM:
         )
         if not text:
             raise RuntimeError("gemini returned no technologies")
+        return _parse_json(text)
+
+    def read_intake(self, *, designs: str, questions: str) -> dict:
+        text = self._generate(
+            [{"text": _INTAKE_USER}],
+            system=_intake_system(designs=designs, questions=questions),
+            max_tokens=_INTAKE_MAX_TOKENS,
+            schema=_INTAKE_SCHEMA,
+        )
+        if not text:
+            raise RuntimeError("gemini returned no intake answers")
         return _parse_json(text)
 
     def find_uncovered(self, *, design: str, standards: str, title: str) -> dict:
@@ -2539,12 +2779,14 @@ class AnthropicLLM:
         document: str = "",
         designs: int = 1,
         alternatives: bool = False,
+        reading: int = 0,
     ) -> dict:
+        temperature, _ = judge_sampling(reading)
         data = self._send(
             {
                 "model": self.model,
                 "max_tokens": 700,
-                "temperature": 0,
+                "temperature": temperature,
                 "messages": [
                     {
                         "role": "user",
@@ -2622,16 +2864,18 @@ class AnthropicLLM:
         return "{" + text
 
     def judge_document(
-        self, *, document: str, reference: str, clause: str, precedents: str = ""
+        self, *, document: str, reference: str, clause: str, precedents: str = "",
+        reading: int = 0,
     ) -> dict:
         system, user = _document_judge_messages(
             document=document, reference=reference, clause=clause, precedents=precedents
         )
+        temperature, _ = judge_sampling(reading)
         data = self._send(
             {
                 "model": self.model,
                 "max_tokens": 2048,
-                "temperature": 0,
+                "temperature": temperature,
                 # The document is the same for every clause of a run.
                 "system": [
                     {"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}
@@ -2685,6 +2929,21 @@ class AnthropicLLM:
                 "system": _lifecycle_system(design=design, products=products, title=title),
                 "messages": [
                     {"role": "user", "content": _LIFECYCLE_USER},
+                    {"role": "assistant", "content": "{"},
+                ],
+            },
+        )
+        return _parse_json("{" + self._text_of(data))
+
+    def read_intake(self, *, designs: str, questions: str) -> dict:
+        data = self._send(
+            {
+                "model": self.model,
+                "max_tokens": _INTAKE_MAX_TOKENS,
+                "temperature": 0,
+                "system": _intake_system(designs=designs, questions=questions),
+                "messages": [
+                    {"role": "user", "content": _INTAKE_USER},
                     {"role": "assistant", "content": "{"},
                 ],
             },
@@ -2804,6 +3063,29 @@ class OpenRouterLLM:
     """
 
     URL = "https://openrouter.ai/api/v1/chat/completions"
+    CREDITS_URL = "https://openrouter.ai/api/v1/credits"
+
+    def credit_remaining(self) -> float | None:
+        """Credit left on this key, or None where it cannot be told.
+
+        Advisory, and deliberately unable to stop a run by failing: every way
+        this can go wrong — the endpoint moved, the shape changed, the network
+        blinked, the key has no billing to report — returns None, and the
+        caller treats None as "carry on". The only thing it is allowed to do is
+        say, before the first clause, that there is definitely nothing there.
+        """
+        try:
+            with httpx.Client(timeout=15.0) as probe:
+                res = probe.get(self.CREDITS_URL, headers=self._headers())
+            if res.status_code != 200:
+                return None
+            data = res.json().get("data") or {}
+            total, used = data.get("total_credits"), data.get("total_usage")
+            if total is None or used is None:
+                return None
+            return float(total) - float(used)
+        except Exception:  # noqa: BLE001 — a failed check must never fail a run
+            return None
 
     def __init__(
         self,
@@ -2834,6 +3116,7 @@ class OpenRouterLLM:
         max_tokens: int,
         model: str | None = None,
         temperature: float = 0.0,
+        seed: int = _SEED,
         schema: dict | None = None,
         name: str = "reply",
         attempts: int = 4,
@@ -2854,7 +3137,13 @@ class OpenRouterLLM:
             # Best effort, not a promise: a provider that supports it gives the
             # same answer to the same prompt more often with a seed held still.
             # Providers that do not support it ignore it.
-            "seed": _SEED,
+            #
+            # Held still for the first judge reading and moved for every one
+            # after it. A second reading at a higher temperature but on this
+            # same seed is the same draw from the same distribution, which is
+            # the one thing a vote between readings cannot be taken over —
+            # see `judge_sampling`.
+            "seed": seed,
         }
         accepted = _supported(chosen)
         if accepted is not None:
@@ -2987,7 +3276,9 @@ class OpenRouterLLM:
         document: str = "",
         designs: int = 1,
         alternatives: bool = False,
+        reading: int = 0,
     ) -> dict:
+        temperature, seed = judge_sampling(reading)
         text = self._chat(
             [
                 {
@@ -3007,6 +3298,8 @@ class OpenRouterLLM:
             max_tokens=2048,
             schema=_VERDICT_SCHEMA,
             name="verdict",
+            temperature=temperature,
+            seed=seed,
         )
         if not text:
             raise RuntimeError("openrouter returned an empty verdict")
@@ -3059,16 +3352,20 @@ class OpenRouterLLM:
         return text
 
     def judge_document(
-        self, *, document: str, reference: str, clause: str, precedents: str = ""
+        self, *, document: str, reference: str, clause: str, precedents: str = "",
+        reading: int = 0,
     ) -> dict:
         system, user = _document_judge_messages(
             document=document, reference=reference, clause=clause, precedents=precedents
         )
+        temperature, seed = judge_sampling(reading)
         text = self._chat(
             [{"role": "system", "content": system}, {"role": "user", "content": user}],
             max_tokens=2048,
             schema=_DOCUMENT_VERDICT_SCHEMA,
             name="verdict",
+            temperature=temperature,
+            seed=seed,
         )
         if not text:
             raise RuntimeError("openrouter returned an empty verdict")
@@ -3125,6 +3422,20 @@ class OpenRouterLLM:
         )
         if not text:
             raise RuntimeError("openrouter returned no technologies")
+        return _parse_json(text)
+
+    def read_intake(self, *, designs: str, questions: str) -> dict:
+        text = self._chat(
+            [
+                {"role": "system", "content": _intake_system(designs=designs, questions=questions)},
+                {"role": "user", "content": _INTAKE_USER},
+            ],
+            max_tokens=_INTAKE_MAX_TOKENS,
+            schema=_INTAKE_SCHEMA,
+            name="intake",
+        )
+        if not text:
+            raise RuntimeError("openrouter returned no intake answers")
         return _parse_json(text)
 
     def find_uncovered(self, *, design: str, standards: str, title: str) -> dict:
@@ -3323,6 +3634,16 @@ def model_name() -> tuple[str, str]:
     return chosen.provider, chosen.model
 
 
+def credit_remaining() -> float | None:
+    """What is left on the key paying for this run, where the provider says.
+
+    None from any provider that does not report it, which is every one but
+    OpenRouter today. Callers must treat None as unknown, never as empty.
+    """
+    probe = getattr(client(), "credit_remaining", None)
+    return probe() if callable(probe) else None
+
+
 def judge(
     *,
     reference: str,
@@ -3332,6 +3653,7 @@ def judge(
     document: str = "",
     designs: int = 1,
     alternatives: bool = False,
+    reading: int = 0,
 ) -> dict:
     # `document` and `designs` both have to be passed through here. Without
     # `document` the analyse stage's `document=` raised TypeError on every
@@ -3349,10 +3671,16 @@ def judge(
         # project would be judged with the one-solution rule and a control in
         # one candidate would answer the clause for the other.
         alternatives=alternatives,
+        # And again. Dropped here, every reading of a clause would be reading
+        # zero — the same temperature on the same seed — so a run would pay for
+        # three readings and vote on one opinion repeated three times.
+        reading=reading,
     )
 
 
-def judge_document(*, document: str, reference: str, clause: str, precedents: str = "") -> dict:
+def judge_document(
+    *, document: str, reference: str, clause: str, precedents: str = "", reading: int = 0
+) -> dict:
     """A verdict on one clause from the whole document, with quotes to check.
 
     See `whole_document.py`: the reply's quotes are evidence only once found in
@@ -3360,7 +3688,11 @@ def judge_document(*, document: str, reference: str, clause: str, precedents: st
     any of them.
     """
     return client().judge_document(
-        document=document, reference=reference, clause=clause, precedents=precedents
+        document=document,
+        reference=reference,
+        clause=clause,
+        precedents=precedents,
+        reading=reading,
     )
 
 
@@ -3392,6 +3724,17 @@ def find_technologies(*, design: str, products: str, title: str) -> dict:
     against the product list and the design before anything is looked up.
     """
     return client().find_technologies(design=design, products=products, title=title)
+
+
+def read_intake(*, designs: str, questions: str) -> dict:
+    """The intake form's structured questions, answered from the designs.
+
+    Field names, quotes and section labels only; see
+    Workers/aidp/request_intake.py, which checks every quote against the design
+    it was read from before a requestor is shown anything. Nothing this returns
+    is ever stored as an answer — it is a proposal a person accepts.
+    """
+    return client().read_intake(designs=designs, questions=questions)
 
 
 def find_uncovered(*, design: str, standards: str, title: str) -> dict:

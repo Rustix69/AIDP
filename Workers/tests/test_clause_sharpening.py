@@ -276,5 +276,168 @@ ok(
 ok("and a non-list evidence field is no evidence", standards.evidence_of({"evidence": "x"}) == [])
 
 
+# ---------------------------------------------------------------------------
+print("\n8. The register row the proposal would become")
+
+# A register clause carries its row's identity under sourceRefs.register. Six of
+# this customer's standards are spreadsheets, so this is the common shape, not
+# the exotic one.
+REGISTER_CLAUSE = dict(
+    CLAUSE,
+    clauseRef="DAT-004",
+    sourceRefs={
+        "register": {
+            "id": "DAT-004",
+            "category": "Data Architecture",
+            "owner": "Data Platform Team",
+            "status": "adopted",
+            "notes": "",
+        }
+    },
+)
+
+IDENTITY = {
+    "identifier": "DAT-004a",
+    "parentIdentifier": "DAT-004",
+    "category": "Data Architecture",
+    "owner": "Data Platform Team",
+    "status": standards.PROPOSED_STATUS,
+}
+
+GOOD_ENTRY = {
+    "title": "Curated Layer Access",
+    "statement": "Consumption layers must read data only through the curated layer.",
+    "rationale": "A consumer reading the raw layer is coupled to a schema nobody agreed to keep stable.",
+}
+
+
+def entry_drafted(entry: dict, clause=REGISTER_CLAUSE, identity=IDENTITY) -> standards.Drafted:
+    body = reply(one(GOOD))
+    body["entry"] = entry
+    return standards.check(body, clause=clause, evidence=EVIDENCE, identity=identity)
+
+
+out = entry_drafted(GOOD_ENTRY)
+ok("the drafted row is kept", out.entry.get("statement") == GOOD_ENTRY["statement"], out.entry)
+ok("with its title", out.entry.get("title") == "Curated Layer Access")
+ok("and its rationale", out.entry.get("rationale") == GOOD_ENTRY["rationale"])
+
+# The point of the whole column: identity is carried, never written by a model.
+ok("the reference is derived, not drafted", out.entry.get("identifier") == "DAT-004a")
+ok("the row it grew out of is named", out.entry.get("parentIdentifier") == "DAT-004")
+ok("the category is carried over", out.entry.get("category") == "Data Architecture")
+ok("the owner is carried over", out.entry.get("owner") == "Data Platform Team")
+ok("and nothing a model wrote is adopted", out.entry.get("status") == "proposed")
+
+# A model that returns an identifier must not be able to set one. This is the
+# check that stops a reference somebody has cited in a design being reused.
+out = entry_drafted(dict(GOOD_ENTRY, identifier="DAT-009", status="adopted", owner="Someone Else"))
+ok("a drafted identifier is ignored", out.entry.get("identifier") == "DAT-004a", out.entry)
+ok("a drafted status is ignored", out.entry.get("status") == "proposed")
+ok("a drafted owner is ignored", out.entry.get("owner") == "Data Platform Team")
+
+# The statement passes the floor a requirement line passes, because an approver
+# reading a plausible row reads it for sense rather than auditing it.
+out = entry_drafted(dict(GOOD_ENTRY, statement="Consumption layers read from the curated layer."))
+ok("a statement that is not a rule is dropped", "statement" not in out.entry, out.entry)
+ok("and the reason is kept", "statement not written as a rule" in reasons(out), out.set_aside)
+
+out = entry_drafted(dict(GOOD_ENTRY, statement="Layers must use an appropriate access path."))
+ok("a vague statement is dropped", "statement" not in out.entry)
+ok("with its reason", "statement a design could not be failed on" in reasons(out))
+
+out = entry_drafted(
+    dict(GOOD_ENTRY, statement="The Field Telemetry Ingestion consumer must use the curated layer.")
+)
+ok("a statement naming the design is dropped", "statement" not in out.entry)
+ok(
+    "and says which name",
+    any("names the design itself" in r for r in reasons(out)),
+    out.set_aside,
+)
+
+out = entry_drafted(dict(GOOD_ENTRY, title="Field Telemetry Ingestion Access"))
+ok("a title naming the design is dropped", "title" not in out.entry, out.entry)
+
+out = entry_drafted(dict(GOOD_ENTRY, title="x" * 200))
+ok("an overlong title is dropped", "title" not in out.entry)
+out = entry_drafted(dict(GOOD_ENTRY, rationale="x" * 500))
+ok("an overlong rationale is dropped", "rationale" not in out.entry)
+
+# One bad column must not take the good ones with it.
+out = entry_drafted(dict(GOOD_ENTRY, statement="Layers read from the curated layer."))
+ok("a refused column leaves the others standing", out.entry.get("title") == "Curated Layer Access")
+ok("and the requirement lines are untouched", out.requirements == [GOOD], out.requirements)
+
+# A clause from a prose standard has no register row behind it. The prose the
+# model wrote is still worth keeping — publishing a rule of its own needs a
+# title and a statement whether or not the library is a spreadsheet — but it
+# must be given no reference, category or owner, because inventing those would
+# claim this standard is filed somewhere it is not.
+out = standards.check(
+    {**reply(one(GOOD)), "entry": GOOD_ENTRY}, clause=CLAUSE, evidence=EVIDENCE
+)
+ok("a prose clause still gets the words", out.entry.get("statement") == GOOD_ENTRY["statement"])
+ok("but no reference", not out.entry.get("identifier"), out.entry)
+ok("no category", not out.entry.get("category"))
+ok("and no owner", not out.entry.get("owner"))
+
+out = standards.check(reply(one(GOOD)), clause=REGISTER_CLAUSE, evidence=EVIDENCE, identity=IDENTITY)
+ok("a reply with no entry still carries the identity", out.entry.get("identifier") == "DAT-004a")
+ok("and states nothing it was not given", "statement" not in out.entry, out.entry)
+
+out = standards.check(
+    {**reply(one(GOOD)), "entry": "not an object"},
+    clause=REGISTER_CLAUSE,
+    evidence=EVIDENCE,
+    identity=IDENTITY,
+)
+ok("a malformed entry yields the identity, not a raise", out.entry.get("category") == "Data Architecture")
+
+# ---------------------------------------------------------------------------
+print("\n9. The reference a rule published beside another would carry")
+
+ok("suffixed, never renumbered", standards.next_reference("DAT-004", set()) == "DAT-004a")
+ok(
+    "and skips one already taken",
+    standards.next_reference("DAT-004", {"DAT-004a", "DAT-004b"}) == "DAT-004c",
+)
+ok(
+    "a rule grown from a suffixed rule does not stack suffixes",
+    standards.next_reference("DAT-004a", {"DAT-004a"}) == "DAT-004b",
+)
+ok("a clause with no reference is given none", standards.next_reference("", set()) == "")
+ok(
+    "and twenty-six is where it stops asking",
+    standards.next_reference("DAT-004", {f"DAT-004{chr(c)}" for c in range(ord("a"), ord("z") + 1)})
+    == "",
+)
+
+# ---------------------------------------------------------------------------
+print("\n10. Reading a register row off a clause")
+
+ok(
+    "the row is found where the parser wrote it",
+    standards.register_of(REGISTER_CLAUSE)["category"] == "Data Architecture",
+)
+ok(
+    "and where an older publish left it",
+    standards.register_of(
+        {"sourceRefs": {"inherited": {"register": {"id": "DAT-004", "category": "Data"}}}}
+    )["identifier"]
+    == "DAT-004",
+)
+ok("a prose clause has none", standards.register_of(CLAUSE) == {})
+ok("and malformed refs raise nothing", standards.register_of({"sourceRefs": "x"}) == {})
+
+ok(
+    "the model is shown the category it must write in",
+    "Category: Data Architecture" in standards.render_clause(REGISTER_CLAUSE),
+)
+ok(
+    "and who owns the row",
+    "Owned by: Data Platform Team" in standards.render_clause(REGISTER_CLAUSE),
+)
+
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)

@@ -22,6 +22,7 @@ import threading
 import time
 
 from . import cache, credentials, db, logs, progress, queue, usage
+from .ai import llm
 from .config import get_config
 from .stages import analyse as analyse_stage
 from .stages import chunk as chunk_stage
@@ -87,7 +88,7 @@ def _expire_suggestions(max_age_days: int, interval: float = EXPIRE_EVERY) -> No
         try:
             deleted = sum(
                 cache.sweep(kind, max_age_days=max_age_days)
-                for kind in (cache.ADVICE, cache.LIFECYCLE)
+                for kind in (cache.ADVICE, cache.LIFECYCLE, cache.INTAKE)
             )
             if deleted:
                 logs.info(
@@ -181,7 +182,13 @@ def main() -> int:
         except Exception as exc:  # noqa: BLE001 — one bad document must not stop the stage
             logs.error(log, "job failed", exc=True, jobId=job.id, error=str(exc)[:500])
             reason = f"{type(exc).__name__}: {exc}"
-            state = queue.fail(job, reason)
+            # An exhausted key is not a bad minute: retrying it four more times
+            # with backoff cannot buy credits, and every attempt pushes the real
+            # reason further down the log. Fail it where it stands so the run is
+            # reported, and whatever it had already judged is kept — the analyse
+            # stage skips clauses that have a finding, so adding credits and
+            # re-queueing resumes rather than starting again.
+            state = queue.fail(job, reason, fatal=isinstance(exc, llm.QuotaExhausted))
             if state == "dead":
                 # Surface the dead letter where someone will see it. Without
                 # this the queue knows the work is stuck and the UI shows a

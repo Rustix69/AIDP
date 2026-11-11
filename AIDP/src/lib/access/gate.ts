@@ -1,7 +1,8 @@
+import { cache } from "react";
 import { headers } from "next/headers";
 import { redirect } from "next/navigation";
 import { auth } from "@/lib/auth";
-import { prisma } from "@/lib/prisma";
+import { prisma, withDbTimeout } from "@/lib/prisma";
 import { resolveActive, type OrganisationSummary } from "@/lib/ingest/org";
 import { grantsAccess } from "./roster-status";
 import { OWNER, MEMBER, isOwner, toRole, type OrgRole } from "./roles";
@@ -48,30 +49,40 @@ export class NoAccess extends Error {
   }
 }
 
-/** The signed-in account, or null. Reads the database rather than trusting the
- *  session payload: `isPlatformAdmin` decides what the admin console shows, and
- *  a stale session should not be able to assert it. */
-export async function currentUser() {
-  const session = await auth.api.getSession({ headers: await headers() });
+/**
+ * The signed-in account, or null. Reads the database rather than trusting the
+ * session payload: `isPlatformAdmin` decides what the admin console shows, and
+ * a stale session should not be able to assert it.
+ *
+ * Memoised for the length of one request — see the note on `requireAccess`.
+ */
+export const currentUser = cache(async () => {
+  const session = await withDbTimeout(
+    auth.api.getSession({ headers: await headers() }),
+    "reading your session",
+  );
   if (!session?.user) return null;
 
-  const user = await prisma.user.findUnique({
-    where: { id: session.user.id },
-    select: {
-      id: true,
-      name: true,
-      email: true,
-      company: true,
-      isPlatformAdmin: true,
-    },
-  });
+  const user = await withDbTimeout(
+    prisma.user.findUnique({
+      where: { id: session.user.id },
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        company: true,
+        isPlatformAdmin: true,
+      },
+    }),
+    "loading your account",
+  );
   if (!user) return null;
 
   // Bootstrap: an operator listed in PLATFORM_ADMIN_EMAILS becomes one on their
   // next request. Only ever promotes, and only from a value that requires a
   // deploy to change.
   return user.isPlatformAdmin ? user : await promoteFromEnvironment(user);
-}
+});
 
 /**
  * Attach a newly registered account to the organisation that invited it.
@@ -163,9 +174,21 @@ export async function admit(user: {
       const role = toRole(invite.role);
       // Both writes together: a membership without the roster link would leave
       // the owner's list showing an invitation that has plainly been accepted.
+      //
+      // `upsert`, not `create`: this runs on the admitted employee's first
+      // request, and a first request is exactly when two of them can be in
+      // flight at once — a second tab, or a reload on a slow connection. A
+      // bare create loses that race on `@@unique([userId, organisationId])` and
+      // the refusal reaches the person as a broken screen, on the one visit
+      // where nothing has gone wrong at all. Admission is a fact to arrive at,
+      // not an event to replay, so saying it twice has to be harmless.
       await prisma.$transaction([
-        prisma.membership.create({
-          data: { userId: user.id, organisationId: organisation.id, role },
+        prisma.membership.upsert({
+          where: {
+            userId_organisationId: { userId: user.id, organisationId: organisation.id },
+          },
+          create: { userId: user.id, organisationId: organisation.id, role },
+          update: {},
         }),
         prisma.rosterEntry.update({
           where: { id: invite.id },
@@ -251,8 +274,29 @@ export async function admit(user: {
  * Throws `NoAccess` with a stated reason rather than returning null, so a
  * caller cannot forget to check. Pages catch it and render the reason; Server
  * Actions let it become a refusal.
+ *
+ * Memoised per request with React's `cache`, which is a correctness fix before
+ * it is an optimisation.
+ *
+ * A layout renders concurrently with its page and both call this, so every
+ * authenticated screen resolved the caller twice over. The two runs overlap,
+ * so it costs little wall-clock on a healthy database — but it is twice the
+ * queries and twice the connections held, which is the wrong direction to be
+ * pointing when the pool is what is under strain.
+ *
+ * The real reason is that `admit` *writes*. Two concurrent copies of a first
+ * sign-in both found no membership and both took the founding path, so a new
+ * account reliably ended up owning two organisations — measured, not feared:
+ * every test signup produced exactly two until this landed. When the two slugs
+ * happened to agree, one request died on the unique constraint instead and the
+ * person's first ever dashboard came apart in front of them. One call per
+ * request is what makes that path single-threaded again; `resolveActive` holds
+ * the line across requests.
+ *
+ * `cache` is per render pass, so this never serves one request's answer to
+ * another, and revocation still takes effect on the very next request.
  */
-export async function requireAccess(): Promise<Access> {
+export const requireAccess = cache(async (): Promise<Access> => {
   const user = await currentUser();
   if (!user) {
     throw new NoAccess({
@@ -270,7 +314,7 @@ export async function requireAccess(): Promise<Access> {
     role: outcome.role,
     isOwner: outcome.role === OWNER,
   };
-}
+});
 
 /**
  * Access for a page or layout, resolved to a destination rather than an error.
@@ -285,8 +329,11 @@ export async function requireAccess(): Promise<Access> {
  * workspace is *sent* somewhere they can: an operator to their console,
  * everybody else to a page that explains why. Pages and layouts use this;
  * Server Actions keep `requireAccess`, because a POST has no destination.
+ *
+ * Memoised alongside `requireAccess` so that a layout and its page share one
+ * answer rather than each paying for their own.
  */
-export async function requireWorkspace(): Promise<Access> {
+export const requireWorkspace = cache(async (): Promise<Access> => {
   try {
     return await requireAccess();
   } catch (error) {
@@ -300,7 +347,7 @@ export async function requireWorkspace(): Promise<Access> {
 
     redirect(`/no-access?reason=${encodeURIComponent(error.denial.reason)}`);
   }
-}
+});
 
 /**
  * As `requireAccess`, and refuses anyone who is not this customer's own

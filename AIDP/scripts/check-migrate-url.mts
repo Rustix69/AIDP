@@ -26,6 +26,23 @@
  * without `-pooler` — passes through untouched.
  */
 
+/**
+ * Load the same files, in the same order, that prisma.config.ts does.
+ *
+ * This runs as plain node *before* Prisma, so none of Prisma's own env loading
+ * has happened yet and `process.env` holds only what the shell exported. Which
+ * meant this guard refused every local `npm run db:deploy` with "No database
+ * URL is set" while the URL sat in `.env.local` and `prisma migrate` two
+ * commands later could read it perfectly well.
+ *
+ * It passed unnoticed because on Vercel the variables *are* real environment
+ * variables, so the only place it was broken is the one place a developer runs
+ * it by hand.
+ */
+import { config } from "dotenv";
+
+config({ path: [".env.local", ".env"], quiet: true });
+
 const direct = process.env.DIRECT_DATABASE_URL?.trim();
 const pooled = process.env.DATABASE_URL?.trim();
 const chosen = direct || pooled;
@@ -34,7 +51,8 @@ if (!chosen) {
   console.error(
     "\nNo database URL is set, so migrations cannot run.\n\n" +
       "  Set DATABASE_URL (the app's pooled connection string) and\n" +
-      "  DIRECT_DATABASE_URL (the same host with `-pooler` removed).\n",
+      "  DIRECT_DATABASE_URL (the same host with `-pooler` removed),\n" +
+      "  in .env.local, in .env, or in the environment itself.\n",
   );
   process.exit(1);
 }

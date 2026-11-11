@@ -6,6 +6,7 @@ import type { Access } from "@/lib/access/gate";
 import { describeJob, describePipeline, JOB_SELECT, STAGES, type PipelineView } from "./pipeline";
 import { describeScope, resolveFramework } from "./assessment";
 import { designResult, type CompletedRun, type DesignResult } from "./results";
+import { effectiveFinding } from "./verdicts";
 
 /**
  * Projects — the unit of work.
@@ -400,11 +401,15 @@ export async function projectDesigns(
               clauseTitle: true,
               clauseStatement: true,
               verdict: true,
+              obligation: true,
               confidence: true,
               rationale: true,
               evidence: true,
               reviewerState: true,
               reviewerVerdict: true,
+              reviewerObligation: true,
+              reviewerSeverity: true,
+              reviewerRationale: true,
             },
           },
         },
@@ -435,9 +440,16 @@ export async function projectDesigns(
       totalClauses: run.totalClauses,
       completedClauses: run.completedClauses,
       startedAt: run.startedAt,
-      // As the report counts them: a clause the design is silent on is not shown.
-      findings: run.findings.filter((finding) => finding.verdict !== "absent").length,
-      open: run.findings.filter((finding) => finding.verdict === "contradicts").length,
+      // As the report counts them: a clause the design is silent on is not
+      // shown, and a verdict a reviewer corrected counts as what they made it.
+      // A card still advertising three open breaches after somebody overturned
+      // all three is the project list disagreeing with the report behind it.
+      findings: run.findings.filter(
+        (finding) => effectiveFinding(finding).verdict !== "absent",
+      ).length,
+      open: run.findings.filter(
+        (finding) => effectiveFinding(finding).verdict === "contradicts",
+      ).length,
       orphaned:
         (run.state === "queued" || run.state === "running") && document._count.jobs === 0,
     })),
@@ -597,7 +609,16 @@ export async function startProjectRun(
           .filter((design) => !ready.some((candidate) => candidate.id === design.id))
           .map((design) => design.id),
         totalClauses: findingsToAssess,
-        mode: "retrieval",
+        // Not "retrieval" outright any more. A project of several designs still
+        // searches — reading them as one text would put three "page 4"s in front
+        // of a judge whose every quote is checked by page — and `_resolve_mode`
+        // settles that for itself from the designs in scope.
+        //
+        // What this unlocks is the one-design project, which is what an
+        // architecture request is: a single submission in a container that can
+        // hold several. Those were being searched for a reason that only applies
+        // when there is more than one of them.
+        mode: "auto",
       },
       select: { id: true },
     });

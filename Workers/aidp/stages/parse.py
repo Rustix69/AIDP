@@ -16,6 +16,15 @@ the typography said nothing.
 PDF path treats them — and the loose rows around them. The model pass reads the
 structure, as it does for a deck.
 
+A *standards register* is the exception, and it is checked for first. Where a
+workbook states one standard per row — an identifier, a statement, a rationale
+in columns of their own — nothing has to be inferred, so `registers.py` reads
+it outright and the model is never called. Each row becomes a section numbered
+with the register's own `SEC-006`, holding one clause; the workbook's other
+sheets are kept as sections carrying no clauses. Before this existed a register
+indexed as a grid and yielded no clauses at all, which left the framework empty
+and failed every assessment against it.
+
 **PPTX.** A deck states its own structure — `slides.py` reads the titles,
 outline depth and speaker notes straight out of the file — but stating it is not
 the same as it being usable. Slide titles are not clause headings and a bullet
@@ -42,6 +51,8 @@ from ..parsing import (
     docs,
     furniture,
     pagination,
+    registers,
+    technologies,
     rules,
     sections,
     sheets,
@@ -187,6 +198,10 @@ class _Result:
         # a format it does not cover, or the feature switched off.
         self.source_lines: list[rules.SourceLine] | None = None
         self.rule_outcome: rules.Outcome | None = None
+        # A technology stack's rows, when the workbook turned out to be one.
+        # Empty for every other shape. These are not clauses and are never
+        # assessed against — see parsing/technologies.py.
+        self.technologies: list = []
 
     def issue(self, severity: str, kind: str, detail: str, *, page=None, ref=None) -> None:
         self.issues.append(
@@ -1080,25 +1095,74 @@ def _parse_workbook(raw: bytes, document: dict, heartbeat) -> _Result:
     out.profile = "workbook"
     heartbeat()
 
-    progress.step("Working out the headings with a model")
-    read = ai_structure.structure(book.lines, document_title=out.title, hints=book.hints)
-    if read.sections:
-        _adopt_structure(out, read)
-    else:
-        # Either no model is configured or it found nothing to mark. A
-        # requirements matrix is the ordinary case here — every rule is a row,
-        # and rows are not prose — so this is a normal outcome rather than a
-        # failure. The tables below still carry the content, and each row is
-        # still retrievable on its own.
+    # A register states its own structure, so it never reaches the model. See
+    # registers.py: one row is one standard, already separated, already named,
+    # with its statement and rationale in columns of their own. Checked before
+    # the model pass rather than after it as a fallback, because the model pass
+    # on a register is both an expense and a way to be wrong about something
+    # the file was explicit about.
+    register = registers.read(
+        book.tables,
+        sheet_names={table.page_start: (table.caption or "") for table in book.tables},
+    )
+    if register is not None:
+        return _parse_register(out, book, register, document)
+
+    # A technology stack states what is *approved* rather than what is
+    # required. Checked here, after the register and before the model, for the
+    # same two reasons the register is: the sheet is explicit about its own
+    # structure, so nothing has to be inferred, and a model pass over it is
+    # both an expense and a way to be wrong about something the file said
+    # plainly. See parsing/technologies.py, which also explains why this and
+    # `registers.read` cannot both claim the same workbook.
+    stack = technologies.read(
+        book.tables,
+        sheet_names={table.page_start: (table.caption or "") for table in book.tables},
+    )
+    if stack is not None:
+        out.technologies = stack.technologies
+        out.profile = "technology-stack"
+        logs.info(
+            log,
+            "technology stack detected",
+            technologies=len(stack.technologies),
+            **stack.counts,
+        )
+        # The prose around the grids — the Assumptions sheet, mostly — still
+        # becomes sections so the workbook stays readable and retrievable. The
+        # rows above are the payload; these are the context around them.
         out.sections = sections.whole_document(book.lines, document_title=out.title)
         if not out.sections:
+            # Ordinary for a stack rather than a failure: the technologies are
+            # already read, and a workbook with nothing outside its grid has
+            # simply said everything it has to say in the grid.
             out.issue(
-                "high",
-                "no_sections",
-                "Nothing could be read from this workbook. It holds no text outside its "
-                "grids, so there was no prose to structure.",
+                "low",
+                "stack_without_prose",
+                f"This technology stack holds {len(stack.technologies)} technologies and no "
+                "text outside its grids, so there was no prose to structure.",
             )
             return out
+    else:
+        progress.step("Working out the headings with a model")
+        read = ai_structure.structure(book.lines, document_title=out.title, hints=book.hints)
+        if read.sections:
+            _adopt_structure(out, read)
+        else:
+            # Either no model is configured or it found nothing to mark. A
+            # requirements matrix is the ordinary case here — every rule is a
+            # row, and rows are not prose — so this is a normal outcome rather
+            # than a failure. The tables below still carry the content, and
+            # each row is still retrievable on its own.
+            out.sections = sections.whole_document(book.lines, document_title=out.title)
+            if not out.sections:
+                out.issue(
+                    "high",
+                    "no_sections",
+                    "Nothing could be read from this workbook. It holds no text outside its "
+                    "grids, so there was no prose to structure.",
+                )
+                return out
 
     heartbeat()
 
@@ -1128,6 +1192,112 @@ def _parse_workbook(raw: bytes, document: dict, heartbeat) -> _Result:
             ),
     ) or None
     _flag_content_loss(out, book.lines)
+    return out
+
+
+def _parse_register(out: _Result, book, register, document: dict) -> _Result:
+    """A standards register — every row a standard, nothing inferred.
+
+    The register sheet becomes one section per standard, numbered with the
+    register's own identifier so that findings cite `SEC-006` rather than a
+    position in a grid. The workbook's other sheets are kept as sections of
+    their own rather than discarded: these registers carry an Assumptions sheet
+    recording what the rows were derived from and which of them are proposals
+    rather than policy, which is exactly the context a reviewer asks for when a
+    finding looks wrong. It is indexed and searchable, and it holds no clauses,
+    so nothing in it is ever assessed against.
+    """
+    out.profile = "register"
+    title = out.title or document["title"] or "Standards"
+    sections_built, clauses = registers.build(register, title)
+    out.sections = sections_built
+    out.clauses = clauses
+
+    # Everything that is not the register: the Categories roll-up, the
+    # Assumptions note, and any further sheet. Grouped by sheet so each keeps
+    # its own name, and appended after the standards so the reading order still
+    # opens with them.
+    other = sorted({line.page for line in book.lines} - {register.sheet})
+    sheet_sections: dict[int, int] = {}
+    for sheet in other:
+        lines = [line for line in book.lines if line.page == sheet]
+        if not lines:
+            continue
+        sheet_sections[sheet] = len(out.sections)
+        sheet_title = lines[0].text[:200]
+        body = lines[1:]
+        index = len(out.sections)
+        out.sections.append(
+            sections.Section(
+                ordinal=index + 1,
+                number_text=None,
+                title=sheet_title,
+                depth=1,
+                heading_path=f"{title} › {sheet_title}",
+                page_start=sheet,
+                page_end=sheet,
+                lines=body or lines,
+            )
+        )
+        for table in book.tables:
+            if table.page_start == sheet:
+                out.tables.setdefault(index, []).append(table)
+
+    if register.incomplete:
+        out.issue(
+            "medium",
+            "register_row_incomplete",
+            f"{len(register.incomplete)} row(s) carry a standard identifier but no "
+            f"statement, so there is no rule to assess against: "
+            f"{', '.join(register.incomplete[:12])}"
+            f"{'…' if len(register.incomplete) > 12 else ''}. "
+            "Fill the Standard Statement cell and re-ingest.",
+        )
+
+    # What the library actually got, said plainly. The engine judges a design
+    # against a clause's *requirements*, so how many standards carry none is the
+    # single number that predicts how sharp the findings will be — a run against
+    # statement-only clauses returns mostly "partial", and that has to read as a
+    # known property of the source rather than as the assessment having failed.
+    total = len(register.standards)
+    thin = register.without_requirements
+    summary = (
+        f"Read as a standards register: {total} standards, one per row, cited by their "
+        "own identifiers."
+    )
+    if not register.has_requirements_column:
+        out.issue(
+            "medium",
+            "register_without_requirements",
+            f"{summary} The sheet has no Requirements column, so every standard is judged "
+            "on its statement alone and findings will be broad — expect mostly 'partial'. "
+            "Add a Requirements column with one obligation per line to have designs "
+            "measured against testable points.",
+        )
+    elif thin:
+        out.issue(
+            "low" if len(thin) * 2 < total else "medium",
+            "register_requirements_missing",
+            f"{summary} {len(thin)} of {total} state no requirements, so those are judged "
+            f"on their statement alone: {', '.join(thin[:12])}"
+            f"{'…' if len(thin) > 12 else ''}.",
+        )
+    else:
+        stated = sum(len(s.requirements) for s in register.standards)
+        out.issue(
+            "low",
+            "register_read",
+            f"{summary} Every standard states its requirements — {stated} testable "
+            "obligations in all.",
+        )
+
+    # What the parsed-content screen reads back, and what a whole-document
+    # assessment quotes. Pure — no model call — so this costs a register
+    # nothing. See `registers.source_lines` for what is deliberately left out.
+    out.source_lines = registers.source_lines(register, book, sheet_sections) or None
+
+    _flag_empty_sections(out)
+    _flag_no_clauses(out, document)
     return out
 
 
@@ -1301,6 +1471,12 @@ def _flag_no_clauses(out: _Result, document: dict) -> None:
     anything it found surprising would be worse than one that says so.
     """
     if document.get("role") != "reference":
+        return
+    # A technology stack yields no clauses *because it states no rules*, and
+    # this warning is what made a correct parse look like a broken one: the
+    # stack template ingested cleanly, produced 215 technologies and 0 clauses,
+    # and the report said the document "contributes exactly nothing".
+    if out.technologies:
         return
 
     found = sum(len(c) for c in out.clauses.values())
@@ -1781,10 +1957,140 @@ def _persist(job: Job, document: dict, out: _Result) -> None:
             ),
         )
 
+        if out.technologies:
+            _persist_technologies(conn, document, out)
+            # The file decides what it is, not the uploader. A stack uploaded
+            # as a reference standard would otherwise sit in the library
+            # contributing no clauses to every assessment — which is exactly
+            # how this one was first read. `role` also stops it at parse: it
+            # has nothing to retrieve against and is never assessed.
+            db.execute(
+                conn,
+                'UPDATE "document" SET "role" = \'technology\' WHERE "id" = %s',
+                (job.document_id,),
+            )
+
         if rules_schema and out.source_lines:
             _persist_rules(conn, job.document_id, out)
 
         queue.complete(conn, job)
+
+
+def _persist_technologies(conn, document: dict, out: _Result) -> None:
+    """A technology stack's rows, and a record of every position they moved to.
+
+    **Upserted on (document, name), never deleted and re-inserted.** The stack
+    row is what a `TechnologyChange` hangs off, so dropping the table and
+    rebuilding it would cascade away the history of who changed what — the one
+    thing the audit log exists to keep. A technology's name is its only
+    identity here, which is what makes the upsert possible at all.
+
+    **The workbook wins on a re-parse, and the log says it did.** A person may
+    have moved something to `hold` through the product since the last ingest,
+    and re-reading the file will put the file's own position back. That is the
+    predictable rule — re-ingesting a document means taking what the document
+    says — but it must not be silent, so a row is appended to the change log
+    whenever the position actually moves. The history then reads
+    "sreyash: adopt -> hold", then "ingest: hold -> adopt", which is the truth.
+
+    **Rows that vanish from the sheet are removed.** A technology dropped from
+    the stack is no longer part of it, and leaving it behind would keep it
+    being matched against designs. Its change history goes with it; there is no
+    row left for the history to be about.
+    """
+    if not out.technologies:
+        return
+
+    organisation_id = document["organisationId"]
+    document_id = document["id"]
+
+    before = {
+        row["name"]: row
+        for row in db.query(
+            conn,
+            'SELECT "id", "name", "status" FROM "technology" WHERE "documentId" = %s',
+            (document_id,),
+        )
+    }
+
+    moved = 0
+    for technology in out.technologies:
+        existing = before.get(technology.name)
+        technology_id = existing["id"] if existing else db.new_id()
+        db.execute(
+            conn,
+            """
+            INSERT INTO "technology" (
+                "id", "organisationId", "documentId", "name", "category", "status",
+                "approvedVersions", "justification", "scenarios", "owner",
+                "addedDate", "lastReviewedDate", "notes", "ordinal", "updatedAt"
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now()
+            )
+            ON CONFLICT ("documentId", "name") DO UPDATE SET
+                "category"         = EXCLUDED."category",
+                "status"           = EXCLUDED."status",
+                "approvedVersions" = EXCLUDED."approvedVersions",
+                "justification"    = EXCLUDED."justification",
+                "scenarios"        = EXCLUDED."scenarios",
+                "owner"            = EXCLUDED."owner",
+                "addedDate"        = EXCLUDED."addedDate",
+                "lastReviewedDate" = EXCLUDED."lastReviewedDate",
+                "notes"            = EXCLUDED."notes",
+                "ordinal"          = EXCLUDED."ordinal",
+                "updatedAt"        = now()
+            """,
+            (
+                technology_id,
+                organisation_id,
+                document_id,
+                technology.name[:500],
+                technology.category[:200],
+                technology.status,
+                technology.approved_versions[:500],
+                technology.justification[:2000],
+                technology.scenarios[:2000],
+                technology.owner[:200],
+                technology.added_date[:100],
+                technology.last_reviewed_date[:100],
+                technology.notes[:2000],
+                technology.ordinal,
+            ),
+        )
+
+        # Only where the position actually moved. A re-parse that changes
+        # nothing should not fill the history with rows saying so.
+        if existing is None or existing["status"] != technology.status:
+            moved += 1
+            db.execute(
+                conn,
+                """
+                INSERT INTO "technology_change" ("id", "technologyId", "from", "to", "source")
+                VALUES (%s, %s, %s, %s, 'ingested')
+                """,
+                (
+                    db.new_id(),
+                    technology_id,
+                    "" if existing is None else existing["status"],
+                    technology.status,
+                ),
+            )
+
+    gone = set(before) - {technology.name for technology in out.technologies}
+    if gone:
+        db.execute(
+            conn,
+            'DELETE FROM "technology" WHERE "documentId" = %s AND "name" = ANY(%s)',
+            (document_id, list(gone)),
+        )
+
+    logs.info(
+        log,
+        "technology stack persisted",
+        technologies=len(out.technologies),
+        moved=moved,
+        removed=len(gone),
+    )
 
 
 def _persist_rules(conn, document_id: str, out: _Result) -> None:

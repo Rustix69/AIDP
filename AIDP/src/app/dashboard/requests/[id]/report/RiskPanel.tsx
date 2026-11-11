@@ -1,6 +1,8 @@
 import { AlertTriangle, CircleHelp, Minus } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { BRIEF_SEVERITY_LABEL, type BriefSeverity } from "@/lib/ingest/verdicts";
+import { Panel } from "@/components/ui/Panel";
+import { Pill, type PillTone } from "@/components/ui/Pill";
 import type { RiskView } from "@/lib/ingest/risk";
 
 /**
@@ -13,35 +15,36 @@ import type { RiskView } from "@/lib/ingest/risk";
  * question rather than as a clean bill of health, and never carries a grade.
  */
 
-const TONE: Record<BriefSeverity, string> = {
-  critical: "border-danger-line bg-danger-tint text-danger",
-  high: "border-warn-line bg-warn-tint text-warn",
-  medium: "border-warn-line bg-warn-tint text-warn",
-  low: "border-line bg-canvas-sunk text-ink/70",
+/** The severity words are the product's own, so the pill tone is named after
+ *  the tier rather than mapped through a second vocabulary. */
+const TONE: Record<BriefSeverity, PillTone> = {
+  critical: "critical",
+  high: "high",
+  medium: "medium",
+  low: "low",
 };
 
 export function RiskPanel({ risk }: { risk: RiskView }) {
   const assessed = risk.rows.filter((row) => row.assessed);
 
   return (
-    <section className="rounded-xl border border-line bg-card">
-      <div className="border-b border-line px-4 py-3">
-        <h2 className="text-[13.5px] font-medium text-ink">Risk</h2>
-        <p className="mt-0.5 text-[12px] text-ink/60">
-          {assessed.length === 0
-            ? "Nothing in this run spoke to any of these. That is not the same as nothing being wrong."
-            : `${assessed.length} of ${risk.rows.length} dimensions could be assessed from this submission.`}
-        </p>
-      </div>
-
+    <Panel
+      title="Risk matrix"
+      blurb={
+        assessed.length === 0
+          ? "Nothing in this run spoke to any of these. That is not the same as nothing being wrong."
+          : `${assessed.length} of ${risk.rows.length} dimensions could be assessed from this submission.`
+      }
+      flush
+    >
       <ul className="divide-y divide-line">
         {risk.rows.map((row) => (
-          <li key={row.dimension} className="px-4 py-3">
+          <li key={row.dimension} className="px-5 py-3.5">
             <div className="flex items-start justify-between gap-3">
               <div className="min-w-0">
                 <p
                   className={cn(
-                    "text-[13px] font-medium",
+                    "text-[13px] font-semibold",
                     row.assessed ? "text-ink" : "text-ink/55",
                   )}
                 >
@@ -53,42 +56,35 @@ export function RiskPanel({ risk }: { risk: RiskView }) {
               {/* The grade, or the absence of one. An unassessed dimension shows
                   a question, not a dash that reads as "clear". */}
               {row.assessed && row.severity ? (
-                <span
-                  className={cn(
-                    "shrink-0 rounded-full border px-2.5 py-0.5 text-[11.5px] font-medium",
-                    TONE[row.severity],
-                  )}
-                >
+                <Pill tone={TONE[row.severity]} className="shrink-0">
                   {BRIEF_SEVERITY_LABEL[row.severity]}
-                </span>
+                </Pill>
               ) : row.assessed ? (
-                <span className="inline-flex shrink-0 items-center gap-1 rounded-full border border-ok-line bg-ok-tint px-2.5 py-0.5 text-[11.5px] text-ok">
-                  <Minus size={11} aria-hidden="true" />
+                <Pill tone="ok" icon={<Minus size={11} aria-hidden="true" />} className="shrink-0">
                   Nothing raised
-                </span>
+                </Pill>
               ) : (
-                <span className="inline-flex shrink-0 items-center gap-1 rounded-full border border-line px-2.5 py-0.5 text-[11.5px] text-ink/55">
-                  <CircleHelp size={11} aria-hidden="true" />
+                <Pill
+                  tone="neutral"
+                  icon={<CircleHelp size={11} aria-hidden="true" />}
+                  className="shrink-0"
+                >
                   Not assessed
-                </span>
+                </Pill>
               )}
             </div>
 
             {row.clauses.length > 0 && (
               <ul className="mt-2 flex flex-wrap gap-1.5">
                 {row.clauses.slice(0, 6).map((clause) => (
-                  <li
-                    key={clause.ref}
-                    className={cn(
-                      "rounded-full border px-2 py-0.5 text-[11.5px]",
-                      TONE[clause.severity],
-                    )}
-                  >
-                    {clause.ref}
-                    {/* An unsettled grade is the engine saying a person has to
-                        look. It travels with the number, because "Low" on its
-                        own reads as "small". */}
-                    {!clause.settled && <span className="opacity-70"> · unsettled</span>}
+                  <li key={clause.ref}>
+                    <Pill tone={TONE[clause.severity]} dot={false} className="font-mono">
+                      {clause.ref}
+                      {/* An unsettled grade is the engine saying a person has
+                          to look. It travels with the number, because "Low" on
+                          its own reads as "small". */}
+                      {!clause.settled && <span className="opacity-70"> · unsettled</span>}
+                    </Pill>
                   </li>
                 ))}
                 {row.clauses.length > 6 && (
@@ -120,6 +116,6 @@ export function RiskPanel({ risk }: { risk: RiskView }) {
           </li>
         ))}
       </ul>
-    </section>
+    </Panel>
   );
 }

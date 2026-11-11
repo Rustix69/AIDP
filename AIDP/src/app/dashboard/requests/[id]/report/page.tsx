@@ -20,12 +20,18 @@ import { buildRisk } from "@/lib/ingest/risk";
 import { nextStep } from "@/lib/ingest/next-step";
 import {
   BRIEF_SEVERITY_LABEL,
-  briefSeverityOf,
-  readObligation,
+  effectiveFinding,
   type BriefSeverity,
 } from "@/lib/ingest/verdicts";
 import { cn } from "@/lib/cn";
 import { PageHeader } from "@/components/ui/PageHeader";
+import { StatCard } from "@/components/ui/StatCard";
+import { Panel } from "@/components/ui/Panel";
+import { Pill, type PillTone } from "@/components/ui/Pill";
+import { FindingCard } from "@/components/ui/FindingCard";
+import { StackBar } from "@/components/ui/charts";
+import { Stepper, requestStep } from "@/components/ui/Stepper";
+import { Cell, DataTable, Row } from "@/components/ui/DataTable";
 import { RiskPanel } from "./RiskPanel";
 
 export const dynamic = "force-dynamic";
@@ -44,11 +50,23 @@ export const dynamic = "force-dynamic";
  * states that rule rather than acting on it. Recording an outcome is still a
  * person pressing a button.
  */
-const TONE: Record<BriefSeverity, string> = {
-  critical: "border-danger-line bg-danger-tint text-danger",
-  high: "border-warn-line bg-warn-tint text-warn",
-  medium: "border-warn-line bg-warn-tint text-warn",
-  low: "border-line bg-canvas-sunk text-ink/70",
+/** The four tiers, as pills. The severity words are the product's own, so the
+ *  pill tone is named after the tier rather than mapped through a second
+ *  vocabulary. */
+const TONE: Record<BriefSeverity, PillTone> = {
+  critical: "critical",
+  high: "high",
+  medium: "medium",
+  low: "low",
+};
+
+/** The same four, as the fills of the severity bar. A tint would vanish at
+ *  22px tall, so these are the solid rungs. */
+const BAND: Record<BriefSeverity, string> = {
+  critical: "bg-danger",
+  high: "bg-warn",
+  medium: "bg-warn/55",
+  low: "bg-line-strong",
 };
 
 const ROUTE_TONE = {
@@ -74,6 +92,7 @@ export default async function ReportPage({
       <>
         <Back id={id} />
         <PageHeader eyebrow={request.reference} title="Review report" />
+        <Stepper current={requestStep(request.state)} />
         <p className="rounded-xl border border-line bg-card px-4 py-4 text-[13px] text-ink/75">
           {request.state === "draft"
             ? "This request has not been submitted yet."
@@ -99,10 +118,14 @@ export default async function ReportPage({
 
   // Graded once, here, and read from this everywhere below — so the scorecard,
   // the risk view and the route cannot disagree about what a finding is worth.
-  const graded = findings.map((finding) => ({
-    finding,
-    grade: briefSeverityOf(finding.verdict, readObligation(finding.obligation)),
-  }));
+  // Graded on what each finding says *now* — the engine's verdict where nobody
+  // has touched it, the reviewer's where they have. A report that kept quoting
+  // an overturned breach would be telling its own reviewer their judgement did
+  // not reach the page they are about to take to a board.
+  const graded = findings.map((finding) => {
+    const effective = effectiveFinding(finding);
+    return { finding, effective, grade: effective.brief };
+  });
 
   const counts: Record<BriefSeverity, number> = { critical: 0, high: 0, medium: 0, low: 0 };
   let unsettled = 0;
@@ -133,6 +156,9 @@ export default async function ReportPage({
       clauseRef: f.clauseRef,
       verdict: f.verdict,
       obligation: f.obligation,
+      reviewerVerdict: f.reviewerVerdict,
+      reviewerObligation: f.reviewerObligation,
+      reviewerSeverity: f.reviewerSeverity,
     })),
     advice,
     readLifecycle(run.lifecycle),
@@ -160,109 +186,192 @@ export default async function ReportPage({
         eyebrow={`${request.reference} · Review report`}
         title={request.title || "Untitled request"}
         lede="The significance check and the standards review, together, and what the brief says happens next."
+        meta={`Generated from the assessment run · ${findings.length} finding${
+          findings.length === 1 ? "" : "s"
+        } raised`}
       />
 
-      {/* The two answers, side by side. This pairing is the whole point of the
-          page: neither half decides anything on its own. */}
-      <div className="mb-4 grid gap-3 sm:grid-cols-2">
-        <section
-          className={`rounded-xl border px-4 py-3 ${
-            request.significance === "significant"
-              ? "border-warn-line bg-warn-tint"
-              : request.significance
-                ? "border-ok-line bg-ok-tint"
-                : "border-line bg-card"
-          }`}
-        >
-          <div className="flex items-center gap-1.5">
-            {request.significance === "significant" ? (
-              <ShieldAlert size={14} className="text-warn" aria-hidden="true" />
-            ) : (
-              <ShieldCheck size={14} className={request.significance ? "text-ok" : "text-ink/40"} aria-hidden="true" />
-            )}
-            <h2 className="text-[12px] font-medium uppercase tracking-wide text-ink/70">
-              Significance
-            </h2>
-          </div>
-          <p className="mt-1 text-[14px] font-medium text-ink">
-            {request.significance === "significant"
-              ? "Architecturally significant"
-              : request.significance
-                ? "Not architecturally significant"
-                : "Not determined"}
-          </p>
-          <p className="mt-0.5 text-[12.5px] text-ink/70">
-            {request.significance
-              ? `${triggered.length} of ${criteria.length} categories triggered.`
-              : "This was not filed as an architecture request, so there are no intake answers to check the criteria against."}
-          </p>
-          {triggered.length > 0 && (
-            <ul className="mt-1.5 space-y-0.5">
-              {triggered.map((result) => (
-                <li key={result.id} className="text-[12px] text-ink/75">
-                  {result.categoryLabel}
-                </li>
-              ))}
-            </ul>
-          )}
-        </section>
+      <Stepper current={requestStep(request.state)} />
 
-        <section className="rounded-xl border border-line bg-card px-4 py-3">
-          <h2 className="text-[12px] font-medium uppercase tracking-wide text-ink/70">
-            Compliance
-          </h2>
-          <ul className="mt-1.5 flex flex-wrap gap-1.5">
-            {(["critical", "high", "medium", "low"] as const).map((tier) =>
-              counts[tier] > 0 ? (
-                <li
-                  key={tier}
-                  className={`rounded-full border px-2.5 py-0.5 text-[11.5px] font-medium ${TONE[tier]}`}
-                >
-                  {counts[tier]} {BRIEF_SEVERITY_LABEL[tier]}
-                </li>
-              ) : null,
-            )}
-            {settledCovered > 0 && (
-              <li className="rounded-full border border-ok-line bg-ok-tint px-2.5 py-0.5 text-[11.5px] text-ok">
-                {settledCovered} covered
-              </li>
-            )}
-          </ul>
-          {worst?.grade && (
-            <p className="mt-2 text-[12.5px] text-ink/75">
-              Highest: <span className="font-medium">{worst.finding.clauseRef}</span> —{" "}
-              {worst.finding.clauseTitle}
+      {/* The report's three headline answers, in the order a reviewer asks
+          them: how big is this, what did it break, and how bad is the worst of
+          it. The prototype puts the same three across the top of its report,
+          and the reason holds — every panel below is one of these three
+          expanded, so somebody who only reads the band has still read the
+          report. */}
+      <div className="mb-5 grid gap-3 sm:grid-cols-3">
+        <StatCard
+          icon={
+            request.significance === "significant" ? (
+              <ShieldAlert size={15} strokeWidth={1.9} />
+            ) : (
+              <ShieldCheck size={15} strokeWidth={1.9} />
+            )
+          }
+          label="Significance"
+          value={
+            <span
+              className={cn(
+                "text-[17px]",
+                request.significance === "significant"
+                  ? "text-warn"
+                  : request.significance
+                    ? "text-ok"
+                    : "text-ink/55",
+              )}
+            >
+              {request.significance === "significant"
+                ? "Significant"
+                : request.significance
+                  ? "Not significant"
+                  : "Not determined"}
+            </span>
+          }
+          hint={
+            request.significance
+              ? `${triggered.length} of ${criteria.length} categories triggered`
+              : "Not filed as an architecture request"
+          }
+        />
+        <StatCard
+          label="Findings raised"
+          value={String(findings.length)}
+          hint={
+            settledCovered > 0
+              ? `${settledCovered} clause${settledCovered === 1 ? "" : "s"} covered`
+              : findings.length === 0
+                ? "Nothing raised against your standards"
+                : "Against your standards"
+          }
+        />
+        <StatCard
+          label="Highest severity"
+          value={
+            <span
+              className={cn(
+                "text-[17px]",
+                counts.critical > 0
+                  ? "text-danger"
+                  : counts.high > 0 || counts.medium > 0
+                    ? "text-warn"
+                    : counts.low > 0
+                      ? "text-ink/70"
+                      : "text-ok",
+              )}
+            >
+              {counts.critical > 0
+                ? "Critical"
+                : counts.high > 0
+                  ? "High"
+                  : counts.medium > 0
+                    ? "Medium"
+                    : counts.low > 0
+                      ? "Low"
+                      : "None"}
+            </span>
+          }
+          hint={
+            unsettled > 0
+              ? `${unsettled} could not be graded from the document`
+              : worst?.grade
+                ? `${worst.finding.clauseRef} — ${worst.finding.clauseTitle}`
+                : "Nothing outstanding"
+          }
+        />
+      </div>
+
+      <div className="mb-5 grid gap-4 lg:grid-cols-2">
+        <Panel
+          title="Compliance scorecard"
+          blurb="Every breach this run raised, by the severity it was graded at."
+        >
+          <StackBar
+            className="mt-1"
+            emptyNote="No breaches were raised against the standards in this run."
+            bands={(["critical", "high", "medium", "low"] as const).map((tier) => ({
+              label: BRIEF_SEVERITY_LABEL[tier],
+              value: counts[tier],
+              className: BAND[tier],
+            }))}
+          />
+          {settledCovered > 0 && (
+            <p className="mt-3 border-t border-line pt-3 text-[12.5px] text-ink/62">
+              A further {settledCovered} clause{settledCovered === 1 ? " was" : "s were"}{" "}
+              covered by the design and raised nothing.
             </p>
           )}
-          {unsettled > 0 && (
-            <p className="mt-1 text-[12px] text-ink/60">
-              {unsettled} could not be graded from the document.
+        </Panel>
+
+        <Panel
+          title="Significance criteria"
+          blurb={
+            request.significance
+              ? "The categories the intake answers triggered. Any one of them makes a request significant."
+              : "This was not filed as an architecture request, so there are no intake answers to check."
+          }
+          flush={triggered.length > 0}
+        >
+          {triggered.length > 0 ? (
+            <DataTable head={["Category", "Why"]} minWidth={420}>
+              {triggered.map((result) => {
+                // The working, as the check recorded it. "Cost Impact
+                // triggered because 7,500,000 is at least 5,000,000" is a
+                // line a review board can act on; "Cost Impact: triggered"
+                // is one they have to come back and ask about.
+                const why = (result.triggeredBy as { text?: string; actual?: string }[]) ?? [];
+                return (
+                  <Row key={result.id}>
+                    <Cell className="whitespace-nowrap font-medium text-ink">
+                      {result.categoryLabel}
+                    </Cell>
+                    <Cell className="text-[12.5px] text-ink/65">
+                      {why.length > 0
+                        ? why
+                            .map((entry) =>
+                              entry.actual
+                                ? `${entry.text} The request says ${entry.actual}.`
+                                : entry.text,
+                            )
+                            .join(" ")
+                        : "Triggered."}
+                    </Cell>
+                  </Row>
+                );
+              })}
+            </DataTable>
+          ) : (
+            <p className="text-[13px] text-ink/62">
+              {request.significance
+                ? `None of the ${criteria.length} categories checked were triggered. It can proceed on its findings alone.`
+                : "Nothing to check."}
             </p>
           )}
-        </section>
+        </Panel>
       </div>
 
       {/* What the brief says happens now. Stated, not done — recording an
           outcome is still somebody's decision. */}
-      <section className={`mb-4 rounded-xl border px-4 py-3 ${ROUTE_TONE[step.route]}`}>
-        <div className="flex gap-2">
-          <RouteIcon size={15} className="mt-0.5 shrink-0 text-ink/70" aria-hidden="true" />
+      <section className={`mb-5 rounded-xl border px-4 py-3.5 ${ROUTE_TONE[step.route]}`}>
+        <div className="flex gap-2.5">
+          <RouteIcon size={16} className="mt-0.5 shrink-0 text-ink/70" aria-hidden="true" />
           <div>
-            <p className="text-[13.5px] font-medium text-ink">{step.headline}</p>
-            <p className="mt-0.5 text-[12.5px] text-ink/75">{step.because}</p>
+            <p className="text-[13.5px] font-semibold text-ink">{step.headline}</p>
+            <p className="mt-0.5 text-[12.5px] leading-relaxed text-ink/75">{step.because}</p>
           </div>
         </div>
       </section>
 
-      <div className="mb-4">
+      <div className="mb-5">
         <RiskPanel risk={risk} />
       </div>
 
       {recommendations.length > 0 && (
-        <section className="mb-4 rounded-xl border border-line bg-card">
-          <div className="border-b border-line px-4 py-3">
-            <h2 className="text-[13.5px] font-medium text-ink">Recommendations</h2>
-            <p className="mt-0.5 text-[12px] text-ink/60">
+        <section className="mb-5">
+          <div className="mb-3">
+            <h2 className="font-display text-[16px] font-semibold tracking-[-0.01em] text-ink">
+              Recommendations
+            </h2>
+            <p className="mt-1 text-[12.5px] leading-relaxed text-ink/62">
               What a reviewer would still ask of the design, beyond the standards. Advice,
               never a verdict
               {(advice?.suggestions.length ?? 0) > recommendations.length &&
@@ -270,43 +379,50 @@ export default async function ReportPage({
               .
             </p>
           </div>
-          <ul className="divide-y divide-line">
+
+          {/* Ruled cards rather than list rows: in a board pack each of these
+              is read on its own and argued with on its own, and a divided list
+              makes five separate asks look like one paragraph. */}
+          <div className="grid gap-2.5">
             {recommendations.map((suggestion, index) => (
-              <li key={index} className="px-4 py-2.5">
-                <div className="flex items-start gap-2">
-                  <span
-                    className={cn(
-                      "mt-0.5 shrink-0 rounded-full border px-2 py-0.5 text-[11px]",
-                      suggestion.priority === "high"
-                        ? "border-warn-line bg-warn-tint text-warn"
-                        : "border-line text-ink/60",
-                    )}
-                  >
-                    {CATEGORY_LABEL[suggestion.category]}
-                  </span>
-                  <div className="min-w-0">
-                    <p className="text-[13px] text-ink">{suggestion.title}</p>
-                    {suggestion.component && (
-                      <p className="mt-0.5 text-[12px] text-ink/55">{suggestion.component}</p>
-                    )}
-                  </div>
-                </div>
-              </li>
+              <FindingCard
+                key={index}
+                tone={suggestion.priority === "high" ? "high" : "neutral"}
+                severity={CATEGORY_LABEL[suggestion.category]}
+                reference={suggestion.component || undefined}
+                title={suggestion.title}
+              />
             ))}
-          </ul>
+          </div>
         </section>
       )}
 
-      <div className="flex flex-wrap gap-2">
+      {/* The severity vocabulary, spelled out once, so a pill in a board pack
+          does not need the reader to have been on the findings screen. */}
+      {findings.length > 0 && (
+        <ul className="mb-5 flex flex-wrap gap-1.5">
+          {(["critical", "high", "medium", "low"] as const).map((tier) =>
+            counts[tier] > 0 ? (
+              <li key={tier}>
+                <Pill tone={TONE[tier]}>
+                  {counts[tier]} {BRIEF_SEVERITY_LABEL[tier]}
+                </Pill>
+              </li>
+            ) : null,
+          )}
+        </ul>
+      )}
+
+      <div className="flex flex-wrap gap-2 border-t border-line pt-5">
         <Link
           href={`/dashboard/projects/${request.projectId}/assessment`}
-          className="inline-flex items-center gap-1.5 rounded-full bg-royal px-4 py-1.5 text-[13px] font-medium text-white"
+          className="inline-flex items-center gap-1.5 rounded-full bg-royal px-4 py-2 text-[13px] font-medium text-white transition-colors hover:bg-royal-mid"
         >
           Work the findings
         </Link>
         <a
           href={`/dashboard/requests/${request.id}/report/export`}
-          className="inline-flex items-center gap-1.5 rounded-full border border-line px-4 py-1.5 text-[13px] text-ink/80 hover:text-ink"
+          className="inline-flex items-center gap-1.5 rounded-full border border-line bg-card px-4 py-2 text-[13px] text-ink/80 transition-colors hover:border-line-strong hover:text-ink"
         >
           <Download size={14} aria-hidden="true" />
           Download the report
@@ -314,7 +430,7 @@ export default async function ReportPage({
         {request.documentId && (
           <Link
             href={`/dashboard/documents/${request.documentId}`}
-            className="inline-flex items-center gap-1.5 rounded-full border border-line px-4 py-1.5 text-[13px] text-ink/80 hover:text-ink"
+            className="inline-flex items-center gap-1.5 rounded-full border border-line bg-card px-4 py-2 text-[13px] text-ink/80 transition-colors hover:border-line-strong hover:text-ink"
           >
             What was submitted
           </Link>

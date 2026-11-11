@@ -6,7 +6,9 @@ import { Check, ChevronLeft, ChevronRight, Send } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { saveRequest, submit } from "../actions";
 import { RequestDesigns, type RequestDesign } from "./RequestDesigns";
+import { ReadingPanel, type CurrentAnswers, type ReadingView } from "./ReadingPanel";
 import type { UpdateInput } from "@/lib/ingest/requests";
+import { READABLE_FIELDS } from "@/lib/ingest/reading-vocabulary";
 
 /**
  * The intake form, as four steps rather than one page.
@@ -250,6 +252,8 @@ function YesNo({
 export function IntakeWizard({
   draft,
   designs,
+  diagramId,
+  reading,
   missing,
   canEdit,
 }: {
@@ -258,6 +262,11 @@ export function IntakeWizard({
    *  server. Passed in rather than fetched here: this is a client component,
    *  and a document's indexing state is the page's to read and to refresh. */
   designs: RequestDesign[];
+  /** Which of them the requestor called the architecture diagram, if any. */
+  diagramId: string | null;
+  /** What those designs were read to say, awaiting confirmation. Null when no
+   *  reading has been made. */
+  reading: ReadingView | null;
   /** How many answers the server says are still outstanding. Only the count is
    *  needed here — the list itself is printed by the page, which is where it
    *  belongs and where somebody can read it from any step. */
@@ -272,6 +281,32 @@ export function IntakeWizard({
 
   const set = <K extends keyof Draft>(key: K, value: Draft[K]) =>
     setForm((current) => ({ ...current, [key]: value }));
+
+  /**
+   * Accepted proposals, merged into the form the requestor is looking at.
+   *
+   * The server has already stored these — `acceptProposals` writes them through
+   * `updateRequest` — so this is only about the boxes on screen catching up
+   * without waiting for the refresh. It matters more than it sounds: this step
+   * saves its own fields on the way out, so a requestor who accepts and
+   * immediately clicks "Next" would otherwise save the stale boxes back over
+   * the answers they just accepted.
+   */
+  function merge(values: Partial<Record<string, string | string[] | boolean>>) {
+    setForm((current) => ({ ...current, ...values }) as Draft);
+  }
+
+  /** What the boxes a reading could fill currently hold, so a proposal can say
+   *  what accepting it would replace. Text only — it is shown, never stored. */
+  const currentAnswers: CurrentAnswers = Object.fromEntries(
+    READABLE_FIELDS.map((field) => {
+      const value = form[field as keyof Draft];
+      return [
+        field,
+        Array.isArray(value) ? value.join(", ") : typeof value === "boolean" ? "" : String(value ?? ""),
+      ];
+    }),
+  );
 
   /** Only this step's fields, which is what makes saving one step safe. */
   function slice(index: number): UpdateInput {
@@ -395,7 +430,24 @@ export function IntakeWizard({
                 the architecture in words; this is the architecture. Somebody
                 who has a diagram to hand should not have to read four
                 questions before finding out where it goes. */}
-            <RequestDesigns requestId={form.id} designs={designs} canEdit={canEdit} />
+            <RequestDesigns
+              requestId={form.id}
+              designs={designs}
+              diagramId={diagramId}
+              canEdit={canEdit}
+            />
+
+            {/* Straight after the designs and before the first question, which
+                is the only place it makes sense: the offer to fill the answers
+                in is worthless once somebody has typed them. */}
+            <ReadingPanel
+              requestId={form.id}
+              reading={reading}
+              designs={designs.filter((design) => design.status === "ready" && design.chunks > 0).length}
+              current={currentAnswers}
+              canEdit={canEdit}
+              onAccept={merge}
+            />
 
             <div className="sm:col-span-2">
               <Text

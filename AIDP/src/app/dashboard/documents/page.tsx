@@ -1,5 +1,13 @@
 import Link from "next/link";
-import { AlertTriangle, ArrowRight, BookMarked, FolderOpen, Lock } from "lucide-react";
+import {
+  AlertTriangle,
+  ArrowRight,
+  BookMarked,
+  FileStack,
+  FolderOpen,
+  Lock,
+  Scale,
+} from "lucide-react";
 import { cn } from "@/lib/cn";
 import { listDocuments, STATUS_LABEL, isTerminal } from "@/lib/ingest/documents";
 import { requireWorkspace } from "@/lib/access/gate";
@@ -7,7 +15,11 @@ import { PipelineBadge } from "./PipelineStatus";
 import { PipelineWatcher } from "./PipelineWatcher";
 import { ReadyTick, UploadZone } from "./UploadZone";
 import { RemoveStandard } from "./RemoveStandard";
+import { StartingLibrary } from "./StartingLibrary";
+import { libraryStanding } from "@/lib/ingest/standards-library";
+import { REGISTERS } from "@/lib/standards-library";
 import { PageHeader } from "@/components/ui/PageHeader";
+import { StatCard } from "@/components/ui/StatCard";
 
 export const dynamic = "force-dynamic";
 
@@ -25,6 +37,24 @@ export default async function DocumentsPage() {
   const assessed = documents.filter((d) => d.role === "assessed");
   const inFlight = documents.some((d) => !isTerminal(d.status));
 
+  // Counted off the list the page already has, so the band and the shelf under
+  // it cannot disagree about how much is in the library.
+  const clauses = references.reduce((sum, d) => sum + d.clauses, 0);
+  const ready = references.filter((d) => d.status === "ready").length;
+  const toReview = references.reduce((sum, d) => sum + d.issues.high, 0);
+
+  // Which of the product's own registers this organisation holds, so the panel
+  // below can offer the rest. Only read for an administrator, because nobody
+  // else may act on it and a member would be shown an offer that would be
+  // refused.
+  const standing = isOwner ? await libraryStanding(organisation.id) : [];
+  const offers = standing.map((held) => ({
+    key: held.key,
+    title: held.title,
+    standards: REGISTERS.find((r) => r.key === held.key)?.rows.length ?? 0,
+    held: held.documentId !== null,
+  }));
+
   return (
     <>
       <PipelineWatcher active={inFlight} />
@@ -34,6 +64,58 @@ export default async function DocumentsPage() {
         title="Reference Library"
         lede="The clauses every assessment measures against. Designs live in projects, and each one is checked against everything here."
       />
+
+      {/* Above the figures rather than below them: when the library is empty
+          the band is four zeros, and the thing to read first is how to stop it
+          being empty. Once there is something on the shelf this collapses to a
+          single line — by then the customer has chosen, and the only job left
+          is a way back to a register they removed. */}
+      {/* `references` also holds technology stacks, which state what is
+          approved rather than what is required and are never assessed against.
+          An organisation whose only document is a stack still has nothing to
+          measure a design by, so the full panel is right for them. */}
+      {isOwner && (
+        <StartingLibrary
+          offers={offers}
+          compact={references.some((d) => d.role === "reference")}
+        />
+      )}
+
+      {/* The library's own figures, in the band the client's prototype opens
+          every administrative screen with. The clause count is the one that
+          matters: a shelf of twelve documents that yielded no clauses measures
+          nothing, and until this was on the page that only showed up when an
+          assessment came back empty. */}
+      <div className="mb-5 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        <StatCard
+          icon={<BookMarked size={15} strokeWidth={1.9} />}
+          label="Standards"
+          value={String(references.length)}
+          hint={
+            references.length === 0
+              ? "Nothing to measure against yet"
+              : `${ready} read and indexed`
+          }
+        />
+        <StatCard
+          icon={<Scale size={15} strokeWidth={1.9} />}
+          label="Clauses"
+          value={String(clauses)}
+          hint={clauses === 0 ? "None extracted yet" : "Checked on every assessment"}
+        />
+        <StatCard
+          icon={<FileStack size={15} strokeWidth={1.9} />}
+          label="Designs assessed"
+          value={String(assessed.length)}
+          hint={assessed.length === 0 ? "None yet" : "Across your projects"}
+        />
+        <StatCard
+          icon={<AlertTriangle size={15} strokeWidth={1.9} />}
+          label="To review"
+          value={String(toReview)}
+          hint={toReview === 0 ? "Nothing outstanding" : "Standards needing a look"}
+        />
+      </div>
 
       <Group
         icon={<BookMarked size={15} strokeWidth={1.9} />}

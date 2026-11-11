@@ -396,6 +396,10 @@ def _standards(conn, framework_id: str) -> str:
           JOIN "document_section" s ON s."documentId" = fd."documentId"
           JOIN "clause" cl          ON cl."sectionId" = s."id"
          WHERE fd."frameworkId" = %s
+           -- A suspended clause is one this organisation no longer requires,
+           -- so it is not a suggestion either: proposing work against a rule
+           -- the customer has set aside is worse than proposing nothing.
+           AND cl."status" <> 'suspended'
          ORDER BY cl."id"
         """,
         (framework_id,),

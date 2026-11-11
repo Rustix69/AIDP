@@ -1,0 +1,27 @@
+-- Severity as its own lever, independent of the verdict.
+--
+-- 20261106090000 made a finding editable and let a reviewer move its severity
+-- by correcting the obligation. That works, and it is the wrong handle. The
+-- obligation is a claim about what the *standard* says — mandatory, recommended,
+-- permitted — and severity is a judgement about how much *this* breach matters.
+-- Tying the second to the first meant a reviewer who wanted to raise the
+-- priority of one finding had to assert something about the standard's wording
+-- to get it, which is a misstatement in the audit trail to achieve a sort order.
+--
+-- So severity gets its own column. NULL is the normal state and keeps today's
+-- behaviour exactly: worked out from the verdict and the obligation by
+-- severityOf. Every row that exists is NULL, so nothing is backfilled and no
+-- existing report changes.
+--
+-- What this column is NOT allowed to do is change the verdict. A `contradicts`
+-- graded Moderate is still a contradiction and still reports as one everywhere;
+-- a `partial` graded Critical is still partial. The two axes are independent by
+-- construction — separate columns, resolved separately in `effectiveFinding` —
+-- because a severity control that quietly reclassified findings would let
+-- somebody downgrade a breach out of the register by adjusting a priority, and
+-- a compliance tool that allows that cannot be audited.
+--
+-- Not constrained to the three values here. The vocabulary is SEVERITIES in
+-- src/lib/ingest/verdicts.ts and the write path refuses anything outside it,
+-- which is the arrangement every other vocabulary column in this schema has.
+ALTER TABLE "finding" ADD COLUMN "reviewerSeverity" TEXT;

@@ -47,6 +47,8 @@ log = logs.get(__name__)
 EMBEDDING = "embedding"
 ADVICE = "advice"
 LIFECYCLE = "lifecycle"
+#: A reading of a request's designs for the intake form — see request_intake.py.
+INTAKE = "intake"
 
 
 def fingerprint(*parts: str) -> str:

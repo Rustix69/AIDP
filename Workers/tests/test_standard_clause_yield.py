@@ -54,11 +54,20 @@ SAMPLES = pathlib.Path(__file__).resolve().parents[2] / "samples" / "standards"
 
 
 class _Out:
-    """Just enough of `_Result` for the guard: sections, clauses and issues."""
+    """Just enough of `_Result` for the guard: sections, clauses, issues, stack.
 
-    def __init__(self, sections: int, clauses: int):
+    `technologies` is here because the guard reads it: a technology stack
+    yields no clauses by design, and must not be reported as a standard that
+    failed to extract any. Keep this in step with what `_flag_no_clauses`
+    actually touches — a stub that silently lacks a field the guard reads turns
+    a behaviour change into an AttributeError in this file rather than a
+    failing assertion about the behaviour.
+    """
+
+    def __init__(self, sections: int, clauses: int, technologies: int = 0):
         self.sections = list(range(sections))
         self.clauses = {0: list(range(clauses))} if clauses else {}
+        self.technologies = list(range(technologies))
         self.issues: list[dict] = []
 
     def issue(self, severity: str, kind: str, detail: str, *, page=None, ref=None) -> None:
@@ -117,6 +126,21 @@ ok(
     any("clause list" in i["detail"] for i in one.issues),
     one.issues,
 )
+# A technology stack is the one reference document that *should* yield no
+# clauses: it states what is approved, not what is required. Warning about it
+# is what made a correct parse look like a broken one — the stack template
+# ingested cleanly, produced 215 technologies and 0 clauses, and the document
+# was reported as contributing nothing.
+stack = _Out(sections=4, clauses=0, technologies=215)
+parse_stage._flag_no_clauses(stack, REFERENCE)
+ok("a technology stack is not reported as a failed extraction", stack.issues == [], stack.issues)
+
+# And the guard is about stacks specifically, not about zero clauses in
+# general: a standard that genuinely extracted nothing must still be reported.
+empty = _Out(sections=40, clauses=0)
+parse_stage._flag_no_clauses(empty, REFERENCE)
+ok("a standard with no clauses is still reported", "no_clauses" in empty.kinds(), empty.issues)
+
 ok(
     "it is low severity: the document still assesses",
     all(i["severity"] == "low" for i in one.issues),

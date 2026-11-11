@@ -110,27 +110,67 @@ export async function resolveActive(user: {
   }
 
   const name = (user.company || user.name || "My organisation").trim();
-  let slug = slugify(name);
 
-  // Slugs are globally unique; two customers may legitimately share a name.
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    const clash = await prisma.organisation.findUnique({ where: { slug } });
-    if (!clash) break;
-    slug = `${slugify(name)}-${Math.random().toString(36).slice(2, 6)}`;
-  }
+  /**
+   * One founding per person, however many requests are asking at once.
+   *
+   * Everything above this line is a *read*, and a read cannot tell you that
+   * somebody else is halfway through the write. Two concurrent first visits
+   * both saw no membership, both arrived here, and both founded a workspace —
+   * so a new account reliably ended up owning two, with its documents about to
+   * be split between them. The two did not even collide, because the slug
+   * disambiguator is random: the unique constraint sat there looking like a
+   * guard while the duplicate went straight past it. When the random suffixes
+   * *did* agree, one request died on that constraint instead and the dashboard
+   * came apart in the browser.
+   *
+   * An advisory lock keyed on the user id is what makes the check and the
+   * write one decision. It is held for the transaction and released with it,
+   * including if this throws, and it is scoped to this one person — two
+   * different people signing up at the same moment never wait on each other.
+   *
+   * The membership re-read inside the lock is the point of all this: whoever
+   * waited here finds the workspace the winner just founded and joins it
+   * rather than founding a second one.
+   */
+  return prisma.$transaction(async (tx) => {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`org:${user.id}`})::bigint)`;
 
-  const organisation = await prisma.organisation.create({
-    data: {
-      name,
-      slug,
-      memberships: { create: { userId: user.id, role: "owner" } },
-    },
+    const membership = await tx.membership.findFirst({
+      where: { userId: user.id },
+      include: { organisation: true },
+      orderBy: { createdAt: "desc" },
+    });
+    if (membership) {
+      return {
+        id: membership.organisation.id,
+        name: membership.organisation.name,
+        slug: membership.organisation.slug,
+        role: membership.role,
+      };
+    }
+
+    // Slugs are globally unique; two customers may legitimately share a name.
+    let slug = slugify(name);
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const clash = await tx.organisation.findUnique({ where: { slug } });
+      if (!clash) break;
+      slug = `${slugify(name)}-${Math.random().toString(36).slice(2, 6)}`;
+    }
+
+    const organisation = await tx.organisation.create({
+      data: {
+        name,
+        slug,
+        memberships: { create: { userId: user.id, role: "owner" } },
+      },
+    });
+
+    return {
+      id: organisation.id,
+      name: organisation.name,
+      slug: organisation.slug,
+      role: "owner",
+    };
   });
-
-  return {
-    id: organisation.id,
-    name: organisation.name,
-    slug: organisation.slug,
-    role: "owner",
-  };
 }

@@ -9,12 +9,17 @@ import {
   READY,
   advanceSubmitted,
   canEditRequest,
+  diagramOf,
   getRequestDraft,
+  unanswered,
   whatIsMissing,
 } from "@/lib/ingest/requests";
+import { readingFor } from "@/lib/ingest/reading";
 import { assessableDesigns } from "@/lib/ingest/projects";
 import { resultsFor } from "@/lib/significance/record";
 import { PageHeader } from "@/components/ui/PageHeader";
+import { Pill, type PillTone } from "@/components/ui/Pill";
+import { Stepper, requestStep } from "@/components/ui/Stepper";
 import { IntakeWizard, type Draft } from "./IntakeWizard";
 import { RequestDesigns } from "./RequestDesigns";
 import { StartAssessing } from "./StartAssessing";
@@ -36,6 +41,17 @@ const STATE: Record<string, { label: string; blurb: string }> = {
   reported: { label: "Reported", blurb: "The review is done and the report is ready." },
   decided: { label: "Decided", blurb: "An outcome has been recorded." },
   failed: { label: "Stopped", blurb: "It could not be carried further." },
+};
+
+/** Where each state sits on the one scale the whole product uses. */
+const STATE_TONE: Record<string, PillTone> = {
+  draft: "neutral",
+  submitted: "info",
+  ready: "info",
+  checking: "info",
+  reported: "ok",
+  decided: "ok",
+  failed: "warn",
 };
 
 /** A date input needs YYYY-MM-DD and nothing else. */
@@ -70,14 +86,6 @@ export default async function RequestPage({
   const editable = request.state === DRAFT || request.state === FAILED;
   const mayEdit = canEditRequest(access, request);
 
-  // The server's own answer, not a copy of it. The wizard shows what this says
-  // and the submit action enforces it; a second opinion in the browser would
-  // eventually disagree with the one that matters.
-  const missing = whatIsMissing({
-    ...request,
-    estimatedCost: request.estimatedCost === null ? null : String(request.estimatedCost),
-  });
-
   const state = STATE[request.state] ?? {
     label: request.state,
     blurb: "",
@@ -97,6 +105,33 @@ export default async function RequestPage({
       status: design.status,
       chunks: design._count.chunks,
     }));
+
+  // The server's own answer, not a copy of it. The wizard shows what this says
+  // and the submit action enforces it; a second opinion in the browser would
+  // eventually disagree with the one that matters.
+  //
+  // Read after the designs, because the diagram only counts while its file is
+  // still one of them — see `diagramOf`. The submit action resolves it the same
+  // way, so the screen and the refusal cannot disagree.
+  const diagramId = diagramOf(request, designs.map((design) => design.id));
+  const renderable = {
+    ...request,
+    estimatedCost: request.estimatedCost === null ? null : String(request.estimatedCost),
+  };
+  const missing = whatIsMissing({ ...renderable, diagramDocumentId: diagramId });
+
+  // What the submission will go in without. With a diagram attached these stop
+  // being the same list as `missing`, and the gap is worth printing: three of
+  // the nine significance categories read Group C, and an unanswered question
+  // never triggers one. See `unanswered`.
+  const blank = diagramId ? unanswered(renderable) : [];
+
+  // What the attached designs were read to say, if anybody has asked. Only
+  // while the request can still take answers — a reading offered on a submitted
+  // request would propose changes to the thing that was assessed.
+  const reading = editable
+    ? await readingFor(access.organisation.id, request.id, designs.map((design) => design.id))
+    : null;
 
   // The brief's Step 2, which runs on submission. Null means it has not run —
   // a draft, or a check that could not be completed — and reads as "not yet"
@@ -157,11 +192,26 @@ export default async function RequestPage({
         eyebrow={request.reference}
         title={request.title || "Untitled request"}
         lede={state.blurb}
-        meta={
-          <span className="inline-flex items-center gap-1.5">
-            <Gauge size={13} aria-hidden="true" />
+        action={
+          <Pill
+            tone={STATE_TONE[request.state] ?? "neutral"}
+            icon={<Gauge size={12} aria-hidden="true" />}
+          >
             {state.label}
-          </span>
+          </Pill>
+        }
+      />
+
+      {/* The five steps of the brief, and which one this request is on. It is
+          repeated on the report screen for the same reason it is here: a
+          person looking at one of them has no other way to see what already
+          happened, or what is still owed. */}
+      <Stepper
+        current={requestStep(request.state)}
+        note={
+          request.state === "submitted"
+            ? "The criteria check and the standards review run together — neither waits on the other."
+            : undefined
         }
       />
 
@@ -255,9 +305,35 @@ export default async function RequestPage({
               </p>
             </div>
           )}
+
+          {/* The diagram relaxes the Group C rule, as the brief says it should.
+              What it must not do is relax it quietly: a blank answer is not a
+              "no", and three of the nine significance categories read these
+              fields. So the submission is allowed and the shortfall is stated,
+              on the screen of the person who can still close it. */}
+          {missing.length === 0 && blank.length > 0 && (
+            <div className="mb-4 rounded-xl border border-warn-line bg-warn-tint px-4 py-3">
+              <p className="flex items-start gap-1.5 text-[12.5px] font-medium text-ink">
+                <CircleAlert size={13} aria-hidden="true" className="mt-0.5 shrink-0 text-warn" />
+                This can be submitted on its diagram, with {blank.length}{" "}
+                {blank.length === 1 ? "question" : "questions"} unanswered
+              </p>
+              <p className="mt-1 text-[12.5px] text-ink/75">
+                No answer was given for {blank.map(({ label }) => label).join(", ")}. The
+                significance check treats an unanswered question as unanswered rather than
+                as “no”, so the categories reading these will have had less to go on.
+              </p>
+              <p className="mt-1 text-[12.5px] text-ink/60">
+                “Read my designs”, on the Architecture step, answers most of them from the
+                documents you have already attached.
+              </p>
+            </div>
+          )}
           <IntakeWizard
             draft={draft}
             designs={designs}
+            diagramId={diagramId}
+            reading={reading}
             missing={missing.length}
             canEdit={mayEdit}
           />
@@ -274,7 +350,12 @@ export default async function RequestPage({
               to be on the same screen as the refusal. */}
           {designs.length > 0 && (
             <div className="mt-4 border-t border-line pt-4">
-              <RequestDesigns requestId={request.id} designs={designs} canEdit={false} />
+              <RequestDesigns
+              requestId={request.id}
+              designs={designs}
+              diagramId={request.diagramDocumentId}
+              canEdit={false}
+            />
             </div>
           )}
 

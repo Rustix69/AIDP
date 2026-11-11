@@ -93,7 +93,7 @@ def scripted(table: dict, clause: str) -> dict | None:
     return None
 
 
-def stub_judge_document(*, document, reference, clause, precedents=""):
+def stub_judge_document(*, document, reference, clause, precedents="", reading: int = 0):
     calls["document"] += 1
     assert "=== page 1 ===" in document, "the judge must be given the stored page text"
     return scripted(DOCUMENT_REPLIES, clause) or {

@@ -18,17 +18,24 @@ import {
   SEVERITY_META,
   VERDICTS,
   VERDICT_META,
-  briefSeverityOf,
-  severityOf,
+  effectiveFinding,
   type Verdict,
 } from "@/lib/ingest/verdicts";
 import { EFFECT_META, SCOPE_META, type DecisionScope } from "@/lib/ingest/decision-effects";
-import { clauseAddress, rationaleSections } from "@/lib/ingest/verdicts";
+import {
+  agreementOf,
+  clauseAddress,
+  dissentOf,
+  notJudged,
+  rationaleSections,
+} from "@/lib/ingest/verdicts";
 import { rowCells } from "@/lib/ingest/table-text";
 import type { TableView } from "@/lib/ingest/documents";
 import type { EvidenceView } from "@/lib/ingest/evidence-tables";
 import { TableFigure } from "@/components/ui/TableFigure";
 import { makeStandard, reviewFinding } from "../actions";
+import { isSharpenable } from "@/lib/ingest/standards-vocabulary";
+import { FindingEditor } from "./FindingEditor";
 import {
   Excerpt,
   StandardProposal,
@@ -216,15 +223,12 @@ function Requirements({ items }: { items: string[] }) {
 export function FindingModal({
   finding,
   project,
-  mayCurate,
   position,
   onNavigate,
   onClose,
 }: {
   finding: FindingView;
   project: ProjectRef | null;
-  /** Whether this person may change the standards. See canManageStandards. */
-  mayCurate: boolean;
   /** Where this finding sits in the list on screen, for "3 of 41". */
   position: { index: number; total: number };
   /** Step by -1 or +1 through the list behind the dialog. */
@@ -243,6 +247,8 @@ export function FindingModal({
    * than it rewrites the standard.
    */
   const [mode, setMode] = useState<"confirm" | "override" | "allow" | null>(null);
+  /** What came back from "Send to decision", shown in place rather than lost. */
+  const [sent, setSent] = useState<string | null>(null);
   const [chosen, setChosen] = useState<string | null>(null);
   const [note, setNote] = useState("");
   const [remember, setRemember] = useState(false);
@@ -322,12 +328,18 @@ export function FindingModal({
     scroller.current?.scrollTo({ top: 0 });
   }, [finding.id]);
 
-  const meta = VERDICT_META[finding.verdict as Verdict] ?? VERDICT_META.needs_review;
-  const severity = severityOf(finding.verdict, finding.obligation);
+  // What this finding says now: the engine's answer where nobody has corrected
+  // it, the reviewer's where they have. Every screen that grades a finding goes
+  // through this one function, so the dialog, the row behind it, the report and
+  // the export cannot disagree about what a finding is worth — see
+  // `effectiveFinding`.
+  const effective = effectiveFinding(finding);
+  const meta = VERDICT_META[effective.verdict as Verdict] ?? VERDICT_META.needs_review;
+  const severity = effective.severity;
   // The same finding on the four-tier scale the governance process grades on.
   // Shown here rather than on the row: the row is scanned, and a second scale
   // beside the first would be two words competing where one has to win.
-  const brief = briefSeverityOf(finding.verdict, finding.obligation);
+  const brief = effective.brief;
   const hasQuotedText = finding.evidence.some((item) => item.sourceKind === "quote");
   const hasExtractedText = finding.evidence.some(
     (item) => item.sourceKind !== "quote" && item.sourceKind !== "figure",
@@ -347,11 +359,13 @@ export function FindingModal({
   // "Gap / Impact / Fix" on a clause that passed contradicts its own
   // verdict, so a covered finding is labelled as the description it is.
   const clauseOpen = clauseOpenFor === finding.id;
-  const sections = rationaleSections(finding.rationale, finding.verdict);
+  const sections = rationaleSections(effective.rationale, effective.verdict);
+  // A failed model call, not a judgement. See the block that renders it.
+  const unjudged = notJudged(effective.rationale);
   // The clause against the design's own words, for the one verdict that is
   // a comparison. Only when both halves exist — half of it is the paragraph
   // it already was.
-  const voices = finding.verdict === "contradicts" ? designVoices(finding.evidence) : [];
+  const voices = effective.verdict === "contradicts" ? designVoices(finding.evidence) : [];
   const facing = voices.length > 0 && Boolean(finding.clauseStatement);
   const draft = finding.draft;
 
@@ -360,18 +374,58 @@ export function FindingModal({
    * "partial" or "needs_review": those are arguments about what the design
    * says, and the answer to them is a verdict, not a dispensation.
    */
-  const allowable = finding.verdict === "contradicts" && project !== null && !decided;
+  const allowable = effective.verdict === "contradicts" && project !== null && !decided;
 
   /**
    * Offered on a confirmed `partial`, and nothing else. A partial somebody has
    * agreed with is the system saying it could not judge the clause as written —
    * the one verdict whose cause may be the wording rather than the design.
    */
+  /**
+   * The three actions the client asked for, and the verdicts that get them.
+   *
+   * A `partial` and a `contradicts` are the two verdicts that say something
+   * about the *clause*, not only about the design: one means the wording could
+   * not be judged, the other that the design broke a rule the wording left
+   * arguable. Both leave a reviewer with the same three ways out — the finding
+   * stands, the finding is wrong, or the standard behind it needs to say more.
+   *
+   * Every other verdict keeps the controls it had. `needs_review` and
+   * `not_assessable` are the engine saying it could not tell, which is not
+   * evidence about the clause; `covered` and `not_applicable` have nothing to
+   * sharpen.
+   */
+  const triaged = isSharpenable(effective.verdict);
+
+  /**
+   * What "Reject" is allowed to mean.
+   *
+   * Two answers, because a rejection makes exactly two claims: the clause is in
+   * fact met, or it does not govern this design. Anything wider turns the
+   * reject button into a reclassifier — a reviewer could move a breach to
+   * "Needs review" and out of the register without ever saying it was wrong.
+   * The finding editor is where a verdict is genuinely corrected, and it keeps
+   * its own history.
+   *
+   * Outside the three-action triage the full list stays, because "Override
+   * verdict" there means precisely the wider thing.
+   */
+  const rejectionVerdicts = triaged
+    ? (["covered", "not_applicable"] as const).filter((v) => v !== effective.verdict)
+    : VERDICTS.filter((v) => v !== effective.verdict && v !== "absent");
+
+  /**
+   * Offered on any partial or contradiction that has not been rejected, and
+   * only once, because a second draft of one finding reads as two independent
+   * proposals agreeing.
+   *
+   * Open to every member, not only an administrator. The reviewer who has just
+   * read the breach is the person who knows what the clause should have said,
+   * and this only *proposes* it: the draft lands in the decisions register as
+   * pending, and approving and publishing it stay the administrator's.
+   */
   const sharpenable =
-    mayCurate &&
-    finding.verdict === "partial" &&
-    finding.reviewerState === "confirmed" &&
-    finding.draft === null;
+    triaged && finding.reviewerState !== "overridden" && finding.draft === null;
 
   /**
    * Record the decision, then close.
@@ -392,6 +446,14 @@ export function FindingModal({
       });
       router.refresh();
       onClose();
+    });
+
+  /** Draft a standard from this finding and send it to the register. */
+  const sendToDecision = () =>
+    startTransition(async () => {
+      const result = await makeStandard(finding.id);
+      setSent(result.message);
+      router.refresh();
     });
 
   /** Pre-arm the whole override: covered, remembered, and confined. */
@@ -516,7 +578,21 @@ export function FindingModal({
             it in full; the dialog covers that row, so for 102 of the stored
             findings the reviewer opened a finding and was told less than the
             list had already told them. See rationaleSections. */}
-        {sections ? (
+        {/* A clause the engine never answered. Shown as what it is rather than
+            in the labelled voice of a judgement: there is no gap, no impact
+            and nothing to fix, and the one useful instruction is to run the
+            assessment again. The provider's error payload is stripped on the
+            way here — see notJudged. */}
+        {unjudged ? (
+          <div className="mb-3.5 rounded-lg border border-line bg-card px-3 py-2.5">
+            <p className="mb-1 font-display text-[11.5px] font-semibold uppercase tracking-[0.06em] text-ink/62">
+              Not judged
+            </p>
+            <p className={cn(PROSE_MEASURE, "text-[15px] leading-relaxed text-ink/88")}>
+              {unjudged}
+            </p>
+          </div>
+        ) : sections ? (
           <dl className="mb-3.5 grid gap-2">
             {sections.map(({ label, text }) => (
               <div key={label} className="grid grid-cols-[66px_1fr] gap-x-3 gap-y-0.5 sm:grid-cols-[92px_1fr]">
@@ -533,9 +609,9 @@ export function FindingModal({
             ))}
           </dl>
         ) : (
-          finding.rationale && (
+          effective.rationale && (
             <p className={cn(PROSE_MEASURE, "mb-3 text-[15px] leading-relaxed text-ink/88")}>
-              {finding.rationale}
+              {effective.rationale}
             </p>
           )
         )}
@@ -735,20 +811,37 @@ export function FindingModal({
           {/* The label is empty for an unstated obligation — see OBLIGATION_META
               — so the separator goes with it rather than leaving a leading
               "· " on the line. */}
-          {OBLIGATION_META[finding.obligation].label && (
+          {OBLIGATION_META[effective.obligation].label && (
             <>
-              <span className="text-ink/72">{OBLIGATION_META[finding.obligation].label}</span>
+              <span className="text-ink/72">{OBLIGATION_META[effective.obligation].label}</span>
               {" · "}
             </>
           )}
-          {OBLIGATION_META[finding.obligation].blurb}
-          {finding.obligation !== "unstated" && finding.obligationSource !== "parsed" && (
+          {OBLIGATION_META[effective.obligation].blurb}
+          {/* Where a reviewer established it, say so instead of describing how
+              the engine read the clause — they are the stronger answer of the
+              two, and attributing their judgement to the model would misstate
+              what the severity rests on. */}
+          {effective.corrected.obligation ? (
             <>
               {" "}
-              {finding.obligationSource === "read"
-                ? "Read from the clause's own wording, not from a structured requirement."
-                : "The model's reading of the clause, not the standard's own structure."}
+              Established by {finding.editedByName || "a reviewer"}, not by the
+              engine, which read this clause as
+              {" "}
+              {OBLIGATION_META[effective.engine.obligation].label.toLowerCase() ||
+                "unstated"}
+              .
             </>
+          ) : (
+            effective.obligation !== "unstated" &&
+            finding.obligationSource !== "parsed" && (
+              <>
+                {" "}
+                {finding.obligationSource === "read"
+                  ? "Read from the clause's own wording, not from a structured requirement."
+                  : "The model's reading of the clause, not the standard's own structure."}
+              </>
+            )
           )}
         </p>
 
@@ -764,6 +857,57 @@ export function FindingModal({
                 "the impact is small. ")}
           Evidence basis: {evidenceBasis}.
         </p>
+
+        {/* How the readings voted.
+            
+            The engine judges each clause more than once and keeps what most
+            readings said, because a model does not answer the same question the
+            same way twice — and an assessment that moves between Tuesday and
+            Thursday is not one an architecture board can be shown. Having gone
+            to that trouble, the report has to say so: "all three readings
+            agreed" and "two of three" are different claims about how settled
+            this finding is, and that difference is a better guide to where a
+            reviewer's attention is worth spending than the model's opinion of
+            its own confidence, which stays internal for exactly that reason.
+
+            The minority is shown rather than summarised. A reading that said
+            "contradicts" under a majority "covered" is the single most useful
+            line on this page for whoever has to sign the report off, and the
+            only honest way to present a 2-of-3 verdict is beside the thing it
+            outvoted. */}
+        {(() => {
+          const vote = agreementOf(finding.readings, finding.agreed);
+          if (!vote) return null;
+          const minority = dissentOf(finding.dissent);
+          return (
+            <div className={cn(PROSE_MEASURE, "mb-3")}>
+              <p
+                className={cn(
+                  "text-[11.5px]",
+                  vote.unanimous ? "text-ink/58" : "text-warn",
+                )}
+              >
+                {vote.label}
+              </p>
+              {minority.length > 0 && (
+                <ul className="mt-1 space-y-1">
+                  {minority.map((other, index) => (
+                    <li
+                      key={`${other.verdict}-${index}`}
+                      className="text-[11.5px] text-ink/58"
+                    >
+                      <span className="font-medium text-ink/75">
+                        One reading said{" "}
+                        {VERDICT_META[other.verdict as Verdict]?.label ?? other.verdict}
+                      </span>
+                      {other.rationale ? <>: {other.rationale}</> : null}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          );
+        })()}
 
         {/* What the verdict rested on besides the document. Shown before the
             review controls, because whether a standing decision was applied
@@ -811,16 +955,37 @@ export function FindingModal({
 
         {draft && <StandardProposal draft={draft} clauseRef={finding.clauseRef} />}
 
+        {/* What came back from "Send to decision". The draft lands on another
+            screen, so without this the press looks like it did nothing. */}
+        {sent && (
+          <p className="mb-2.5 rounded-lg border border-royal-mid/30 bg-royal/[0.06] px-2.5 py-2 text-[11.5px] leading-relaxed text-royal">
+            {sent}{" "}
+            <a
+              href="/dashboard/decisions"
+              className="underline decoration-royal/40 underline-offset-2"
+            >
+              Open Decisions
+            </a>
+          </p>
+        )}
+
         <div className="flex flex-wrap items-center gap-2">
-          <button
-            type="button"
-            disabled={pending}
-            onClick={() => decide(true)}
-            className="inline-flex items-center gap-1.5 rounded-full border border-line px-3 py-1.5 text-[11.5px] text-ink/72 transition-colors hover:border-line-strong hover:text-ink disabled:opacity-50"
-          >
-            <Check size={12} />
-            Confirm issue
-          </button>
+          {/* The bare one-click confirm, for the verdicts that are not triaged
+              through the three actions below. A reviewer agreeing with twenty
+              `needs_review` rows should still do it in one press each; a
+              partial or a contradiction is asked for a reason instead, because
+              the reason is what the register is made of. */}
+          {!triaged && (
+            <button
+              type="button"
+              disabled={pending}
+              onClick={() => decide(true)}
+              className="inline-flex items-center gap-1.5 rounded-full border border-line px-3 py-1.5 text-[11.5px] text-ink/72 transition-colors hover:border-line-strong hover:text-ink disabled:opacity-50"
+            >
+              <Check size={12} />
+              Confirm issue
+            </button>
+          )}
 
           {mode ? (
             /* Choosing a verdict no longer submits on the spot. The reason
@@ -831,11 +996,20 @@ export function FindingModal({
               {mode === "override" && (
                 <div className="flex flex-wrap items-center gap-1.5">
                   <span className="mr-1 text-[11.5px] text-ink/64">
-                    The engine judged this wrongly. Correct verdict:
+                    {triaged
+                      ? "Rejecting this finding. What is actually the case?"
+                      : "The engine judged this wrongly. Correct verdict:"}
                   </span>
                   {/* Not "Absent": that section lists parts of the design, not
-                      clauses, so a clause corrected to it would vanish. */}
-                  {VERDICTS.filter((v) => v !== finding.verdict && v !== "absent").map((verdict) => (
+                      clauses, so a clause corrected to it would vanish.
+
+                      A rejection is narrowed further, to the only two answers it
+                      can mean: the clause is in fact met, or it does not govern
+                      this design. "Partial" and "Needs review" are not
+                      rejections — they are different findings — and offering
+                      them here is how "reject" quietly becomes "reclassify". A
+                      reviewer who wants one of those has the editor below. */}
+                  {rejectionVerdicts.map((verdict) => (
                     <button
                       key={verdict}
                       type="button"
@@ -856,11 +1030,13 @@ export function FindingModal({
 
               {mode === "confirm" && (
                 <p className="text-[11.5px] text-ink/64">
-                  Agreeing with{" "}
+                  {triaged ? "Approving" : "Agreeing with"}{" "}
                   <span className="text-ink/78">
-                    {VERDICT_META[finding.verdict as Verdict]?.label ?? finding.verdict}
+                    {VERDICT_META[effective.verdict as Verdict]?.label ?? effective.verdict}
                   </span>
-                  . Say why, and it can be kept as a standing decision.
+                  {triaged
+                    ? " — this finding stands and goes into the report as it is."
+                    : ". Say why, and it can be kept as a standing decision."}
                 </p>
               )}
 
@@ -881,7 +1057,11 @@ export function FindingModal({
                 <span className="mb-1 block text-[11.5px] text-ink/64">
                   {mode === "allow"
                     ? "Why is it allowed here? This is the exception's stated basis."
-                    : "Why? This becomes the decision if you keep it."}
+                    : triaged
+                      ? mode === "confirm"
+                        ? "Why does it stand? Required — it is what the report and any future decision rest on."
+                        : "Why is it wrong? Required — a rejection with no stated basis is the one an audit cannot defend."
+                      : "Why? This becomes the decision if you keep it."}
                 </span>
                 <textarea
                   value={note}
@@ -962,6 +1142,10 @@ export function FindingModal({
                   disabled={
                     pending ||
                     (mode !== "confirm" && !chosen) ||
+                    // Both triaged actions are "with reason": the client asked
+                    // for it, and it is the only part of a review that is worth
+                    // anything to the person reading it six months later.
+                    (triaged && !note.trim()) ||
                     // Reachable only in "allow" mode, which arrives with the
                     // box already ticked and nothing written in it yet.
                     (remember && !note.trim())
@@ -976,8 +1160,12 @@ export function FindingModal({
                       ? "Save and allow here"
                       : "Save and remember"
                     : mode === "override"
-                      ? "Save corrected verdict"
-                      : "Save"}
+                      ? triaged
+                        ? "Reject this finding"
+                        : "Save corrected verdict"
+                      : triaged
+                        ? "Approve this finding"
+                        : "Save"}
                 </button>
                 <button
                   type="button"
@@ -990,82 +1178,122 @@ export function FindingModal({
             </div>
           ) : (
             <>
-              {/* Kept beside the bare Confirm rather than replacing it. A
-                  reviewer agreeing with twenty verdicts in a row should still
-                  do it in one click each; this is the door to the register for
-                  the handful that deserve a reason. */}
-              <button
-                type="button"
-                disabled={pending}
-                onClick={() => setMode("confirm")}
-                className="rounded-full border border-line px-3 py-1.5 text-[11.5px] text-ink/68 transition-colors hover:border-royal-mid/50 hover:text-royal disabled:opacity-50"
-              >
-                Confirm issue with a reason…
-              </button>
-              <button
-                type="button"
-                disabled={pending}
-                onClick={() => setMode("override")}
-                className="rounded-full border border-line px-3 py-1.5 text-[11.5px] text-ink/68 transition-colors hover:border-warn-line hover:text-warn disabled:opacity-50"
-              >
-                Override verdict&hellip;
-              </button>
-              {/* Last, and deliberately not dressed as the easy way out: it
-                  is the one action here that lets a design ship against a
-                  standard, and it should take a moment longer to reach than
-                  agreeing with the verdict does. */}
-              {allowable && (
-                <button
-                  type="button"
-                  disabled={pending}
-                  onClick={beginAllow}
-                  className="rounded-full border border-line px-3 py-1.5 text-[11.5px] text-ink/68 transition-colors hover:border-royal-mid/50 hover:text-royal disabled:opacity-50"
-                >
-                  Accept risk for this project…
-                </button>
-              )}
-              {/* The other direction entirely: not a dispensation for this
-                  design but a sharper rule for every design after it. Shown
-                  only once the verdict is agreed, because that agreement is
-                  the whole evidence that the wording was the problem. */}
-              {sharpenable && (
-                <button
-                  type="button"
-                  disabled={pending}
-                  onClick={() =>
-                    startTransition(async () => {
-                      await makeStandard(finding.id);
-                      router.refresh();
-                    })
-                  }
-                  className="inline-flex items-center gap-1.5 rounded-full border border-line px-3 py-1.5 text-[11.5px] text-ink/68 transition-colors hover:border-royal-mid/50 hover:text-royal disabled:opacity-50"
-                >
-                  <Scale size={12} />
-                  Make a standard…
-                </button>
+              {triaged ? (
+                /*
+                  Three ways out of a partial or a contradiction, which are the
+                  only two verdicts that leave a reviewer with a real choice.
+
+                  They answer three different questions and the wording says
+                  which: is this finding right (Approve), is it wrong (Reject),
+                  or is the *standard* behind it the thing at fault (Send to
+                  decision)? The third is the one the product was missing —
+                  without it a reviewer meeting a vague clause for the tenth
+                  time could only keep agreeing with an unjudgeable verdict.
+
+                  Both of the first two take a reason, and that is the change
+                  from the old row. A bare "Confirm" was one click and produced
+                  nothing a later reader could use; the reason is what becomes
+                  the standing decision, and it is the only part of a review
+                  that is worth anything six months later.
+                */
+                <>
+                  <button
+                    type="button"
+                    disabled={pending}
+                    onClick={() => setMode("confirm")}
+                    className="rounded-full border border-line px-3 py-1.5 text-[11.5px] text-ink/68 transition-colors hover:border-ok-line hover:text-ok disabled:opacity-50"
+                  >
+                    Approve with reason
+                  </button>
+                  <button
+                    type="button"
+                    disabled={pending}
+                    onClick={() => {
+                      setMode("override");
+                      // Pre-armed with the commoner of the two answers, so
+                      // rejecting is a reason and a press rather than a puzzle
+                      // about which verdict replaces it.
+                      setChosen("covered");
+                    }}
+                    className="rounded-full border border-line px-3 py-1.5 text-[11.5px] text-ink/68 transition-colors hover:border-warn-line hover:text-warn disabled:opacity-50"
+                  >
+                    Reject
+                  </button>
+                  {sharpenable ? (
+                    <button
+                      type="button"
+                      disabled={pending}
+                      onClick={sendToDecision}
+                      className="inline-flex items-center gap-1.5 rounded-full border border-line px-3 py-1.5 text-[11.5px] text-ink/68 transition-colors hover:border-royal-mid/50 hover:text-royal disabled:opacity-50"
+                    >
+                      <Scale size={12} />
+                      Send to decision
+                    </button>
+                  ) : (
+                    /* Said rather than hidden. A button that silently is not
+                       there is one a reviewer looks for and assumes is broken. */
+                    finding.draft === null &&
+                    finding.reviewerState === "overridden" && (
+                      <span className="text-[11.5px] text-ink/58">
+                        Rejected findings cannot be sent to decision.
+                      </span>
+                    )
+                  )}
+                  {/* Last, and deliberately not dressed as one of the three: it
+                      is the one action here that lets a design ship against a
+                      standard, and it should take a moment longer to reach than
+                      agreeing with the verdict does. */}
+                  {allowable && (
+                    <button
+                      type="button"
+                      disabled={pending}
+                      onClick={beginAllow}
+                      className="text-[11.5px] text-ink/62 underline decoration-ink/25 underline-offset-2 transition-colors hover:text-ink/82 disabled:opacity-50"
+                    >
+                      or accept the risk for this project
+                    </button>
+                  )}
+                </>
+              ) : (
+                /*
+                  Every other verdict keeps the row it had. `needs_review` and
+                  `not_assessable` are the engine saying it could not tell, and
+                  `covered` and `not_applicable` have nothing to sharpen — none
+                  of the three is evidence about the clause, so none of them
+                  gets the third door.
+                */
+                <>
+                  <button
+                    type="button"
+                    disabled={pending}
+                    onClick={() => setMode("confirm")}
+                    className="rounded-full border border-line px-3 py-1.5 text-[11.5px] text-ink/68 transition-colors hover:border-royal-mid/50 hover:text-royal disabled:opacity-50"
+                  >
+                    Confirm issue with a reason
+                  </button>
+                  <button
+                    type="button"
+                    disabled={pending}
+                    onClick={() => setMode("override")}
+                    className="rounded-full border border-line px-3 py-1.5 text-[11.5px] text-ink/68 transition-colors hover:border-warn-line hover:text-warn disabled:opacity-50"
+                  >
+                    Override verdict
+                  </button>
+                </>
               )}
             </>
           )}
         </div>
-        </div>
 
-        {/* Named, because a shortcut nobody is told about is not a feature.
-            Hidden on a phone, where there is no keyboard to use it with. */}
-        <div className="hidden items-center justify-between gap-3 border-t border-line bg-card px-5 py-2 text-[11.5px] text-ink/55 sm:flex">
-          <span>
-            <kbd className="rounded border border-line px-1 font-mono">←</kbd>
-            {" / "}
-            <kbd className="rounded border border-line px-1 font-mono">→</kbd>
-            {" or "}
-            <kbd className="rounded border border-line px-1 font-mono">k</kbd>
-            {" / "}
-            <kbd className="rounded border border-line px-1 font-mono">j</kbd>
-            {" to step between findings"}
-          </span>
-          <span>
-            <kbd className="rounded border border-line px-1 font-mono">Esc</kbd>
-            {" to close"}
-          </span>
+        {/* Below the decision buttons, and deliberately not among them.
+            Confirming, overriding and allowing a breach are one reviewer
+            working a queue — press and move on. Correcting what the finding
+            *says* is a different act with a different rhythm, and mixing a
+            seventh button into that row would make the queue harder to work
+            for the sake of the rarer job. It stays open on every finding,
+            settled or not: a verdict agreed in March can still be wrong in
+            June, and the history is what keeps both positions on the record. */}
+        <FindingEditor finding={finding} />
         </div>
       </div>
     </div>

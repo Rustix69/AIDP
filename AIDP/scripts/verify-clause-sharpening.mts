@@ -20,7 +20,14 @@ import { randomUUID } from "node:crypto";
 import { prisma } from "../src/lib/prisma";
 import { MEMBER, OWNER } from "../src/lib/access/roles";
 import { countClauses } from "../src/lib/ingest/assessment";
-import { applyDraft, draftsForRun, requestDraft } from "../src/lib/ingest/standards";
+import {
+  applyDraft,
+  approveDraft,
+  draftsForRun,
+  listPendingDrafts,
+  requestDraft,
+  unapproveDraft,
+} from "../src/lib/ingest/standards";
 
 const TAG = `zz-sharpen-${Date.now()}`;
 /** How long to wait for a worker to claim the job and answer. */
@@ -171,41 +178,101 @@ try {
     select: { id: true },
   });
 
+  /**
+   * A second finding on the same design, against the same clause.
+   *
+   * Only here to prove two of them can both be sent to decision. The unique
+   * index on the finding is (runId, clauseId, designKey), so a different
+   * `designKey` is enough to make it a separate row without inventing a second
+   * clause nobody is judging.
+   */
+  const secondFinding = await prisma.finding.create({
+    data: {
+      runId: run.id,
+      clauseId: clause.id,
+      designKey: `${TAG}-second`,
+      clauseRef: "9.3",
+      clauseTitle: "Resilience and idempotency",
+      clauseStatement: clause.statement,
+      verdict: "contradicts",
+      confidence: 0.9,
+      rationale: "The design states failed messages are dropped.",
+      evidence: [
+        {
+          chunkId: `${TAG}-chunk-2`,
+          headingPath: "ZZ Field Telemetry Ingestion SAD › 4.2 Message Handling",
+          page: 4,
+          excerpt: "after which they are dropped.",
+        },
+      ],
+      retrievalScore: 0.7,
+      reviewerState: "pending",
+    },
+    select: { id: true },
+  });
+
+  /** Clear the drafts *and* the jobs they queued. A draft deleted on its own
+   *  leaves a live analyse job behind, which the next assertion would then be
+   *  measuring instead of its own. */
+  const clearDrafts = async () => {
+    await prisma.clauseDraft.deleteMany({ where: { organisationId: org.id } });
+    await prisma.job.deleteMany({ where: { organisationId: org.id, stage: "analyse" } });
+  };
+
   console.log("\nWhat is refused before a model is paid for anything");
 
-  // The feature rests entirely on a person having agreed with the verdict.
+  // A finding nobody has adjudicated is allowed through now, and deliberately:
+  // a reviewer meeting a vague clause may decide the right answer is a sharper
+  // rule before they have decided anything about the design. Requiring a
+  // confirmation first forced a judgement they had not reached.
   await prisma.finding.update({
     where: { id: finding.id },
     data: { reviewerState: "pending", reviewedAt: null },
   });
-  ok(
-    "an unconfirmed partial is refused",
-    (await refusal(requestDraft(user.id, finding.id, "ZZ")))?.includes("Confirm this verdict") ===
-      true,
-  );
+  const fromPending = await requestDraft(user.id, finding.id, "ZZ");
+  ok("an unreviewed finding may be sent to decision", fromPending.state === "drafting", fromPending);
+  await clearDrafts();
 
-  // An override says the verdict was wrong; sharpening from one would write the
-  // model's mistake into the library.
+  // A rejection says the engine got this wrong; drafting a rule on the strength
+  // of a verdict the reviewer threw out would write the model's mistake into
+  // the library.
   await prisma.finding.update({
     where: { id: finding.id },
     data: { reviewerState: "overridden", reviewerVerdict: "covered", reviewedAt: new Date() },
   });
   ok(
-    "an overridden one is refused too",
-    (await refusal(requestDraft(user.id, finding.id, "ZZ")))?.includes("Confirm this verdict") ===
-      true,
+    "a rejected finding is refused",
+    (await refusal(requestDraft(user.id, finding.id, "ZZ")))?.includes("has been rejected") === true,
   );
   await prisma.finding.update({
     where: { id: finding.id },
     data: { reviewerState: "confirmed", reviewerVerdict: null },
   });
 
+  // Proposing is open to everyone; approving and publishing are not. The gate
+  // moved rather than went away — see the two refusals further down.
   await asRole(MEMBER);
+  const asMember = await requestDraft(user.id, finding.id, "ZZ Member");
+  ok("a member may propose a standard", asMember.state === "drafting", asMember);
+
+  // Two findings on one design, both sent to decision. Ordinary, and it used to
+  // fail: the draft job carried the design's id, so the second one collided
+  // with the first on `job_live_document_stage_idx` — a unique index that
+  // exists to stop one *document* being queued twice and has nothing to say
+  // about two clauses. A draft job carries no document now.
+  const second = await requestDraft(user.id, secondFinding.id, "ZZ Member");
   ok(
-    "a member cannot change the standards",
-    (await refusal(requestDraft(user.id, finding.id, "ZZ")))?.includes("Only an administrator") ===
-      true,
+    "a second finding on the same design can be sent too",
+    second.id !== asMember.id,
+    { first: asMember.id, second: second.id },
   );
+  ok(
+    "and neither draft job is attached to the design",
+    (await prisma.job.count({
+      where: { organisationId: org.id, stage: "analyse", documentId: { not: null } },
+    })) === 0,
+  );
+  await clearDrafts();
   await asRole(OWNER);
 
   console.log("\nThe worker writes the lines");
@@ -253,11 +320,86 @@ try {
   );
   ok("the clause's existing line came back to read it against", draft.existing.length === 1);
 
-  console.log("\nApproving it replaces the clause rather than rewriting it");
+  console.log("\nIt waits in the register, as pending");
+
+  const queue = await listPendingDrafts(user.id, org.id);
+  ok("the register carries it", queue.some((row) => row.id === draft.id), queue.map((r) => r.id));
+  const listed = queue.find((row) => row.id === draft.id)!;
+  ok("as pending review", listed.state === "ready", listed.state);
+  ok(
+    "carrying its own case, so an approver who never saw the report can judge it",
+    listed.sourceVerdict === "partial" && Boolean(listed.clauseRef),
+    { verdict: listed.sourceVerdict, ref: listed.clauseRef },
+  );
+
+  console.log("\nPublishing is a second gate, not the same press");
 
   const approved = draft.requirements;
+  ok(
+    "a pending proposal cannot be published",
+    (await refusal(applyDraft(user.id, draft.id, approved, "ZZ")))?.includes(
+      "Approve this proposal first",
+    ) === true,
+  );
+
+  await asRole(MEMBER);
+  ok(
+    "a member cannot approve one",
+    (await refusal(approveDraft(user.id, draft.id, "ZZ")))?.includes("Only an administrator") ===
+      true,
+  );
+  ok(
+    "nor publish one",
+    (await refusal(applyDraft(user.id, draft.id, approved, "ZZ")))?.includes(
+      "Only an administrator",
+    ) === true,
+  );
+  await asRole(OWNER);
+
+  await approveDraft(user.id, draft.id, "ZZ Approver");
+  const afterApproval = await prisma.clauseDraft.findUnique({ where: { id: draft.id } });
+  ok("approving moves it on", afterApproval?.state === "approved", afterApproval?.state);
+  ok("and records who", afterApproval?.approvedByName === "ZZ Approver", afterApproval?.approvedByName);
+  ok("it is not in the standard yet", afterApproval?.appliedClauseId === null);
+  ok(
+    "approving twice is refused rather than silently repeated",
+    (await refusal(approveDraft(user.id, draft.id, "ZZ")))?.includes("already been approved") ===
+      true,
+  );
+
+  // Sending it back is a real move: agreeing with a sentence is not a
+  // commitment, and the approver's name must not survive the withdrawal.
+  await unapproveDraft(user.id, draft.id);
+  const withdrawn = await prisma.clauseDraft.findUnique({ where: { id: draft.id } });
+  ok("it can be sent back for review", withdrawn?.state === "ready", withdrawn?.state);
+  ok("and the approval is cleared with it", withdrawn?.approvedByName === "", withdrawn?.approvedByName);
+  await approveDraft(user.id, draft.id, "ZZ Approver");
+
+  // This draft came from a partial, which means the clause could not be judged
+  // as written — so the clause is what changes, and there is no second rule to
+  // write. Refused in words rather than quietly downgraded to a sharpening:
+  // the caller asked for something specific, and getting the other one without
+  // being told is how a library gains a rule nobody intended.
+  ok(
+    "a partial cannot be published as a rule of its own",
+    (
+      await refusal(
+        applyDraft(user.id, draft.id, approved, "ZZ", {
+          mode: "separate",
+          statement: "Something else entirely.",
+        }),
+      )
+    )?.includes("Only a contradiction") === true,
+  );
+
+  console.log("\nPublishing replaces the clause rather than rewriting it");
+
   const { clauseId: sharper, added } = await applyDraft(user.id, draft.id, approved, "ZZ Approver");
-  ok("the approval reports what it added", added === approved.length, added);
+  ok("publishing reports what it added", added === approved.length, added);
+  const afterPublish = await prisma.clauseDraft.findUnique({ where: { id: draft.id } });
+  ok("and records who published it", afterPublish?.publishedByName === "ZZ Approver", afterPublish?.publishedByName);
+  ok("with a time of its own", afterPublish?.publishedAt !== null);
+  ok("and says how it went in", afterPublish?.publishMode === "sharpen", afterPublish?.publishMode);
 
   const before = await prisma.clause.findUnique({ where: { id: clause.id } });
   const after = await prisma.clause.findUnique({ where: { id: sharper } });

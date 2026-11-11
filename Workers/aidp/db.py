@@ -63,9 +63,17 @@ def pool() -> ConnectionPool:
                 _pool = ConnectionPool(
                     cfg.database_url,
                     min_size=1,
-                    # A worker processes one job at a time; the headroom is for the
-                    # reaper and heartbeats running alongside a long handler.
-                    max_size=int(os.environ.get("DB_POOL_MAX", "4")),
+                    # A worker processes one job at a time, but the analyse
+                    # stage judges several clauses of it at once and each of
+                    # them writes its finding in its own transaction. So the
+                    # pool is sized from that concurrency, with headroom for
+                    # the reaper, the heartbeat and the progress write running
+                    # alongside — a pool smaller than the fan-out does not fail,
+                    # it just serialises the work again where nobody can see it.
+                    max_size=int(
+                        os.environ.get("DB_POOL_MAX", "")
+                        or max(4, cfg.assess_concurrency + 4)
+                    ),
                     kwargs={"row_factory": dict_row, "autocommit": True},
                     open=True,
                 )
