@@ -1120,6 +1120,103 @@ export async function advanceSubmitted(
 }
 
 /**
+ * Move a request past "checking" once the run it is waiting on has landed.
+ *
+ * The other half of `advanceSubmitted`, and it exists for the same reason: the
+ * thing that finishes the work is not the thing that owns this column. The
+ * Python worker writes `assessment_run.state` and nothing else — it only ever
+ * SELECTs `architecture_request` — so without a sweep on this side a request
+ * sat in "checking" for good. The run completed, the report filled in, the
+ * stepper stayed on step 3, and the only way to see that the review was done
+ * was to open the report and notice it was no longer growing.
+ *
+ * Why here rather than in the worker, which knows the moment it happens: the
+ * worker would become a writer of a governance table it currently only reads,
+ * and both endings would need it — `_complete` and `_fail`. The run row already
+ * carries the answer, this sweep is idempotent and bounded, and it runs on
+ * exactly the screens where somebody is waiting for it.
+ *
+ * `updateMany` with the state in the filter for the same reason as above: two
+ * screens and a server action reach this, and the second caller to arrive must
+ * write nothing rather than drag a decided request back to "reported".
+ */
+export async function advanceChecking(
+  options: { limit?: number; organisationId?: string; requestId?: string } = {},
+): Promise<{
+  /** Moved to "reported" — the run finished and the report is final. */
+  reported: number;
+  /** Moved to "failed", because the run it was waiting on failed. */
+  failed: number;
+  /** Still running. The ordinary answer while an assessment is in flight. */
+  waiting: number;
+}> {
+  const { limit = 25, organisationId, requestId } = options;
+  const pending = await prisma.architectureRequest.findMany({
+    where: {
+      state: CHECKING,
+      runId: { not: null },
+      ...(requestId ? { id: requestId } : {}),
+      ...(organisationId ? { organisationId } : {}),
+    },
+    select: { id: true, organisationId: true, runId: true },
+    orderBy: { createdAt: "asc" },
+    take: limit,
+  });
+
+  let reported = 0;
+  let failed = 0;
+  let waiting = 0;
+
+  for (const request of pending) {
+    try {
+      const run = await prisma.assessmentRun.findFirst({
+        where: { id: request.runId!, organisationId: request.organisationId },
+        select: { state: true, failureReason: true },
+      });
+
+      // The run is gone. Not a state this should be able to reach, but leaving
+      // the request in "checking" for ever is the one outcome worse than
+      // saying so, and "failed" is editable — the requestor can start again.
+      if (!run) {
+        await stop(request.id, "The assessment of this request is no longer on record.");
+        failed += 1;
+        continue;
+      }
+
+      if (run.state === "failed") {
+        await stop(
+          request.id,
+          run.failureReason
+            ? `The assessment could not be completed: ${run.failureReason}`
+            : "The assessment could not be completed.",
+        );
+        failed += 1;
+        continue;
+      }
+
+      // "queued" and "running" both mean the same thing to a requestor.
+      if (run.state !== "complete") {
+        waiting += 1;
+        continue;
+      }
+
+      const moved = await prisma.architectureRequest.updateMany({
+        where: { id: request.id, state: CHECKING },
+        data: { state: REPORTED, failureReason: null },
+      });
+      if (moved.count > 0) reported += 1;
+    } catch {
+      // A dropped connection. Left in "checking" to be swept again on the next
+      // render — the findings are already written, so nothing is lost by
+      // waiting, and a screen that cannot draw is the worse failure.
+      waiting += 1;
+    }
+  }
+
+  return { reported, failed, waiting };
+}
+
+/**
  * Open the assessment of one request, because somebody pressed the button.
  *
  * The step the flow now ends on. A requestor opens a request, answers the

@@ -7,6 +7,7 @@ import {
   DRAFT,
   FAILED,
   READY,
+  advanceChecking,
   advanceSubmitted,
   canEditRequest,
   diagramOf,
@@ -78,10 +79,15 @@ export default async function RequestPage({
   // and skipped unless this request is actually waiting on one — see the note
   // on the list page for why a page does this at all.
   const stuck = first.state === "submitted" && first.documentId && !first.runId;
-  const request = stuck
-    ? ((await advanceSubmitted({ documentId: first.documentId! })),
-      (await getRequestDraft(access.organisation.id, id)) ?? first)
-    : first;
+  // The same recovery at the far end: this is the screen somebody reloads
+  // while they wait for a report, and the worker never writes this column.
+  const landed = first.state === CHECKING && Boolean(first.runId);
+
+  if (stuck) await advanceSubmitted({ documentId: first.documentId! });
+  else if (landed) await advanceChecking({ requestId: first.id });
+
+  const request =
+    stuck || landed ? ((await getRequestDraft(access.organisation.id, id)) ?? first) : first;
 
   const editable = request.state === DRAFT || request.state === FAILED;
   const mayEdit = canEditRequest(access, request);

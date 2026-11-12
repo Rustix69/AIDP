@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { ClipboardList } from "lucide-react";
 import { requireWorkspace } from "@/lib/access/gate";
-import { advanceSubmitted, listRequests } from "@/lib/ingest/requests";
+import { advanceChecking, advanceSubmitted, listRequests } from "@/lib/ingest/requests";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { Panel } from "@/components/ui/Panel";
 import { Pill, type PillTone } from "@/components/ui/Pill";
@@ -70,6 +70,10 @@ export default async function RequestsPage() {
   // Never throws — see advanceSubmitted — because a page that cannot render
   // its list is a worse failure than a request that waits another minute.
   await advanceSubmitted({ organisationId: organisation.id });
+  // And the other end of the flow: a run that finished while nobody was
+  // looking. The worker does not write this column, so this is where a
+  // request stops saying "checking" — see advanceChecking.
+  await advanceChecking({ organisationId: organisation.id });
 
   const requests = await listRequests(organisation.id);
 
