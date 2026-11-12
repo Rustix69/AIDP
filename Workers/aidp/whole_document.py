@@ -52,11 +52,28 @@ _TYPOGRAPHY = str.maketrans(
 _WORD = re.compile(r"[^\W_]+")
 _ELLIPSIS = re.compile(r"\.\.\.|…")
 
+# A glyph the model failed to transcribe, and the digits it turned into.
+#
+# The documents are clean — `source_line` holds a real "→" and no control
+# characters at all — but a model quoting a table row writes the arrow back as
+# U+0002 followed by a digit run: "Source \x0216 Target" for "Source → Target".
+# The control character is dropped by `_WORD` on its own, so only the digits
+# survive, and a quote that was word-perfect fails to match on two stray
+# numbers. Six of the eight quotes ever refused on a real run were this, every
+# one of them a correct finding demoted to `needs_review`.
+#
+# So a control character takes its adjacent digits with it. That is safe in the
+# one direction it needs to be: a figure that means something never sits flush
+# against a control character, and "peak 1,500 req/s" a space away is untouched.
+# Tab, newline and carriage return are excluded — those are real whitespace in
+# a document, and a digit beside one is an ordinary digit.
+_CORRUPT_GLYPH = re.compile(r"\d*[\x00-\x08\x0b\x0c\x0e-\x1f]+\d*")
+
 
 def normalise(text: str) -> str:
     """Lower-case words separated by single spaces, and nothing else."""
     folded = unicodedata.normalize("NFKC", text or "").translate(_TYPOGRAPHY).lower()
-    return " ".join(_WORD.findall(folded))
+    return " ".join(_WORD.findall(_CORRUPT_GLYPH.sub(" ", folded)))
 
 
 @dataclass

@@ -523,6 +523,7 @@ class LLM(Protocol):
     def find_technologies(self, *, design: str, products: str, title: str) -> dict: ...
     def read_intake(self, *, designs: str, questions: str) -> dict: ...
     def confirm_absent(self, *, document: str, clauses: str) -> dict: ...
+    def review_covered(self, *, clauses: str) -> dict: ...
     def group_findings(self, *, findings: str) -> dict: ...
 
 
@@ -2289,6 +2290,112 @@ _CONFIRM_SCHEMA = {
 _CONFIRM_MAX_TOKENS = 8192
 
 
+# ------------------------------------------------- the other direction: covered
+
+# `_CONFIRM_SYSTEM` above asks whether a claim of silence survives the whole
+# document. This asks the opposite and rarer question, and the engine had no way
+# to ask it at all: whether a claim of compliance survives its own evidence.
+#
+# Every code guard in stages/analyse.py is demote-only and fires on a verdict
+# with NO verified quote. A "covered" that quotes the design accurately and then
+# draws the wrong conclusion from it passes all of them. On a real run clause
+# SEC-006 — multi-factor authentication for privileged access — came back
+# covered at 0.95 with "Legacy operations console has username/password
+# authentication" inside its own verified evidence, and a reviewer was told an
+# unprotected privileged console was compliant.
+#
+# No regex reaches that. The breaching sentence contains no breach vocabulary;
+# it is an ordinary declarative sentence about a legacy system, and what makes
+# it a breach is that the clause says "all privileged access". The judgement is
+# semantic, so it is asked of a model — but asked narrowly, about text already
+# verified to be the design's own words, with the document deliberately absent
+# so there is nothing here to hallucinate from.
+_COVERED_SYSTEM = """\
+A first reading of a submitted design document judged every clause in the next \
+message COVERED - the design meets each requirement the clause states. Each \
+clause comes with the exact passages that reading quoted as its proof.
+
+Your only job: read each clause against its own quoted passages and say whether \
+the proof carries the verdict.
+
+This is the mistake you are looking for. A design satisfies a requirement across \
+most of its estate and names the exception in the same breath - the exception is \
+quoted in the evidence, and the first reading did not account for it:
+
+    clause: "Multi-factor authentication shall be enforced for all privileged
+             access."
+    quoted: "MFA is enforced for corporate SSO, AWS console and remote VPN.
+             ... Legacy operations console has username/password
+             authentication."
+
+The clause says all privileged access. The design's own words name a privileged \
+console without it. That is not covered.
+
+For each clause answer with one verdict:
+
+- "stands"      - the quoted passages meet every requirement of the clause
+- "partial"     - the passages meet the clause for part of what it governs and
+                  state an exception, carve-out, legacy component or excluded
+                  case for which they do not
+- "contradicts" - the passages state something the clause forbids, or forbid
+                  something it requires
+
+Rules that matter:
+
+1. Judge ONLY on the passages given. You are not reading the design document; \
+you are reading what was quoted from it. Never reason from what a well-run \
+system usually has, and never fault a design for a control these passages do \
+not mention.
+2. Silence is not a failure. Where the passages simply do not speak to part of \
+the clause, answer "stands". A requirement nothing addresses is another \
+reading's job, and reporting it here would count the same gap twice.
+3. Any verdict other than "stands" MUST quote the failing words, copied exactly \
+- character for character - from that clause's own passages above. The quote is \
+checked against them and a verdict whose quote is not found is discarded. Quote \
+the words that fail, not the clause and not the whole passage.
+4. The failure has to be a requirement of THIS clause. A carve-out that offends \
+some other standard is not this clause's business.
+5. "stands" is the right answer most of the time. These verdicts were reached by \
+a reading that had the whole document in front of it. Move one only on an \
+exception you can quote.
+6. One sentence: what the passages grant, and what they except from it. No \
+preamble, no restating the clause.
+
+Reply with JSON only:
+{"clauses": [{"clause": 1, "verdict": "stands", "quote": "", "rationale": "one sentence"}]}"""
+
+_COVERED_USER = "Check these clauses against the passages quoted for each:\n\n{clauses}"
+
+_COVERED_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "clauses": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "clause": {"type": "integer"},
+                    "verdict": {
+                        "type": "string",
+                        "enum": ["stands", "partial", "contradicts"],
+                    },
+                    "quote": {"type": "string"},
+                    "rationale": {"type": "string"},
+                },
+                "required": ["clause", "verdict", "quote", "rationale"],
+                "propertyOrdering": ["clause", "verdict", "quote", "rationale"],
+            },
+        }
+    },
+    "required": ["clauses"],
+    "propertyOrdering": ["clauses"],
+}
+
+# Shorter than `_CONFIRM_MAX_TOKENS`: no document is sent, and the reply is one
+# verdict, one quote and one sentence per clause.
+_COVERED_MAX_TOKENS = 4096
+
+
 # ---------------------------------------------------------------- root causes
 
 _GROUP_SYSTEM = """\
@@ -2661,6 +2768,17 @@ class GeminiLLM:
             raise RuntimeError("gemini returned nothing on the absent clauses")
         return _parse_json(text)
 
+    def review_covered(self, *, clauses: str) -> dict:
+        text = self._generate(
+            [{"text": _COVERED_USER.format(clauses=clauses)}],
+            system=_COVERED_SYSTEM,
+            max_tokens=_COVERED_MAX_TOKENS,
+            schema=_COVERED_SCHEMA,
+        )
+        if not text:
+            raise RuntimeError("gemini returned nothing on the covered clauses")
+        return _parse_json(text)
+
     def group_findings(self, *, findings: str) -> dict:
         text = self._generate(
             [{"text": _GROUP_USER.format(findings=findings)}],
@@ -3004,6 +3122,21 @@ class AnthropicLLM:
                 ],
                 "messages": [
                     {"role": "user", "content": _CONFIRM_USER.format(clauses=clauses)},
+                    {"role": "assistant", "content": "{"},
+                ],
+            },
+        )
+        return _parse_json("{" + self._text_of(data))
+
+    def review_covered(self, *, clauses: str) -> dict:
+        data = self._send(
+            {
+                "model": self.model,
+                "max_tokens": _COVERED_MAX_TOKENS,
+                "temperature": 0,
+                "system": [{"type": "text", "text": _COVERED_SYSTEM}],
+                "messages": [
+                    {"role": "user", "content": _COVERED_USER.format(clauses=clauses)},
                     {"role": "assistant", "content": "{"},
                 ],
             },
@@ -3522,6 +3655,20 @@ class OpenRouterLLM:
         )
         if not text:
             raise RuntimeError("openrouter returned nothing on the absent clauses")
+        return _parse_json(text)
+
+    def review_covered(self, *, clauses: str) -> dict:
+        text = self._chat(
+            [
+                {"role": "system", "content": _COVERED_SYSTEM},
+                {"role": "user", "content": _COVERED_USER.format(clauses=clauses)},
+            ],
+            max_tokens=_COVERED_MAX_TOKENS,
+            schema=_COVERED_SCHEMA,
+            name="covered_review",
+        )
+        if not text:
+            raise RuntimeError("openrouter returned nothing on the covered clauses")
         return _parse_json(text)
 
     def group_findings(self, *, findings: str) -> dict:

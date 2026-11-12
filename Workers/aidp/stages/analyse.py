@@ -825,6 +825,20 @@ def handle(job: Job, heartbeat) -> None:
         heartbeat()
         _confirm_absents(run, clauses, scope)
 
+    # And the same doubt pointed the other way. The pass above exists because a
+    # search cannot see everywhere it did not look; this one exists because
+    # every guard in this module is demote-only and fires on a verdict with no
+    # verified quote, so a "covered" that quotes the design correctly and draws
+    # the wrong conclusion from it passed all of them untouched.
+    #
+    # Run in both modes, unlike the absent re-read. Reading the whole document
+    # does not protect against this one — on the run that found it, the
+    # whole-document judge had the breaching sentence in its own cited evidence
+    # and called the clause covered anyway. Never fails the run.
+    progress.step("Re-reading what looked covered")
+    heartbeat()
+    _review_covered(run, clauses)
+
     # The reverse question: what the design does that no clause governs, and the
     # standards that would. After the clauses, so a passage a clause has already
     # judged is never reported as ungoverned. Never fails the run; see coverage.py.
@@ -1064,6 +1078,15 @@ class _Judged:
     # throwing it away would leave the vote asserting a confidence it does not
     # have.
     dissent: list[dict] = field(default_factory=list)
+    # What the model answered, before `_normalise` and the guards touched any of
+    # it: (verdict, confidence, rationale). Carried from the reading that won
+    # the vote, so a replay reads the answer the finding was actually built on.
+    #
+    # Empty on the two paths that reach a verdict without asking a model — a
+    # clause every reading failed on, and a design with nothing retrieved —
+    # where there is no model answer to keep and `_write` falls back to the
+    # finding's own.
+    raw: tuple[str, float, str] | None = None
 
 
 # What a dissenting reading's rationale is cut to. It is context beside the
@@ -1268,6 +1291,7 @@ def _assess_one(
         readings=judged.readings,
         agreed=judged.agreed,
         dissent=judged.dissent,
+        raw=judged.raw,
     )
 
 
@@ -1459,6 +1483,7 @@ def _judged_from(
     return _Judged(
         verdict, confidence, rationale, evidence, applied, best,
         obligation=str(raw.get("obligation") or ""),
+        raw=_raw_answer(raw),
     )
 
 
@@ -1614,6 +1639,7 @@ def _assess_document_one(
             applied,
             0.0,
             obligation=str(raw.get("obligation") or ""),
+            raw=_raw_answer(raw),
         )
 
     judged = _read_and_vote(once, get_config().judge_readings, best=0.0, clause=clause)
@@ -1695,6 +1721,7 @@ def _assess_document_one(
         readings=judged.readings,
         agreed=judged.agreed,
         dissent=judged.dissent,
+        raw=judged.raw,
     )
 
 
@@ -1933,6 +1960,164 @@ def _confirm(run: dict, clauses: list[dict], scope: designs.Scope) -> None:
         of=len(scope.designs),
         changed=changed,
     )
+
+
+#: The confidence recorded for a "covered" its own evidence unseated. Lower than
+#: `CONFIRM_CONFIDENCE`: that pass finds a passage the first reading never saw,
+#: while this one re-reads what the first reading already had and disagrees with
+#: the conclusion drawn from it. Two readings of one text, and the report should
+#: not present the second as the more certain.
+COVERED_REVIEW_CONFIDENCE = 0.6
+
+
+def _review_covered(run: dict, clauses: list[dict]) -> None:
+    """Ask each "covered" whether its own evidence names the exception it ignored.
+
+    The mirror of `_confirm_absents`, and the half the engine was missing. That
+    pass doubts a claim of silence, because a search cannot see everywhere it did
+    not look. This doubts a claim of compliance, because every code guard in this
+    module is demote-only and fires on a verdict with no verified quote — so a
+    "covered" that quotes the design accurately and reasons wrongly from it was
+    the one shape nothing examined.
+
+    Scoped to the finding's own verified passages, never the whole document. The
+    question is narrow enough to answer from them, they are already proven to be
+    the design's own words, and sending the document would invite a second full
+    judgement of a clause the first reading already made with everything in
+    front of it.
+
+    Never raises, for the reason `_confirm_absents` does not: the run's verdicts
+    have to reach the report. A pass that cannot run leaves every "covered"
+    exactly as it was, which is what the engine did before this existed.
+    """
+    try:
+        _reconsider_covered(run, clauses)
+    except Exception as exc:  # noqa: BLE001 — the clause verdicts stand without it
+        logs.warn(
+            log, "covered clauses could not be reviewed", runId=run["id"], error=str(exc)[:300]
+        )
+
+
+def _reconsider_covered(run: dict, clauses: list[dict]) -> None:
+    with db.connection() as conn:
+        rows = db.query(
+            conn,
+            'SELECT "clauseId", "designKey", "evidence", "rationale" FROM "finding" '
+            'WHERE "runId" = %s AND "verdict" = %s',
+            (run["id"], "covered"),
+        )
+
+    by_id = {clause["id"]: clause for clause in clauses}
+    # Evidence is the whole point: a "covered" with nothing verified behind it
+    # has already been demoted by `_guard`, and there would be nothing here to
+    # read it against.
+    pending = [
+        (by_id[row["clauseId"]], row)
+        for row in rows
+        if row["clauseId"] in by_id and _excerpts(row.get("evidence"))
+    ]
+    if not pending:
+        return
+
+    moved = 0
+    for start_at in range(0, len(pending), CONFIRM_BATCH):
+        batch = pending[start_at : start_at + CONFIRM_BATCH]
+        raw = llm.review_covered(clauses=_render_covered(batch))
+        moved += _adopt_covered_review(run, batch, raw)
+
+    logs.info(
+        log, "covered findings reviewed against their own evidence",
+        runId=run["id"], reviewed=len(pending), moved=moved,
+    )
+
+
+def _excerpts(evidence) -> list[str]:
+    """The quoted passages of a finding, as plain strings."""
+    items = evidence if isinstance(evidence, list) else []
+    return [
+        " ".join(str(item.get("excerpt") or "").split())
+        for item in items
+        if isinstance(item, dict) and str(item.get("excerpt") or "").strip()
+    ]
+
+
+def _render_covered(batch: list[tuple[dict, dict]]) -> str:
+    """Each clause and the passages its "covered" verdict rests on, numbered.
+
+    Without the obligation line, like every other string handed to a check
+    rather than to the first judge: how strongly the clause binds is not what is
+    in question here, and the words would only widen what a quote can match.
+    """
+    blocks = []
+    for index, (clause, row) in enumerate(batch, start=1):
+        passages = "\n".join(f"- {text}" for text in _excerpts(row.get("evidence")))
+        blocks.append(
+            f"[{index}] {_render_clause(clause, with_force=False)}\n\n"
+            f"Quoted as proof that the design meets it:\n{passages}"
+        )
+    return "\n\n".join(blocks)
+
+
+def _adopt_covered_review(run: dict, batch: list[tuple[dict, dict]], raw: dict) -> int:
+    """Demote the findings whose own evidence contradicts them, and only those.
+
+    Three conditions, all required. The verdict has to be one that lowers the
+    finding — this pass can never raise one, and "stands" is not written back at
+    all, so a clause it agrees with keeps the confidence and wording it had. The
+    quote has to be in THAT finding's own passages, which is what stops the
+    review inventing an exception the design never stated. And the original
+    evidence is carried over unchanged, because a reviewer reading a demotion
+    needs the passage it turns on.
+    """
+    items = raw.get("clauses") if isinstance(raw.get("clauses"), list) else []
+    moved = 0
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        number = _page_number(item.get("clause"))
+        if number is None or not 1 <= number <= len(batch):
+            continue
+        verdict = str(item.get("verdict", "")).strip().lower()
+        # Demote-only. "stands" is the expected answer and needs no write; any
+        # other verdict is one this pass is not allowed to reach.
+        if verdict not in ("partial", "contradicts"):
+            continue
+
+        clause, row = batch[number - 1]
+        quote = " ".join(str(item.get("quote") or "").split())
+        passages = " ".join(_excerpts(row.get("evidence")))
+        # Checked against this finding's passages alone, not the document. A
+        # quote found elsewhere in the design is not what the first reading
+        # relied on, and demoting a verdict over it would be answering a
+        # question nobody asked.
+        if not whole_document.contains(passages, quote):
+            logs.warn(
+                log,
+                "the covered verdict stands: the quoted words are not in its own evidence",
+                clauseId=clause["id"],
+                quote=quote[:300],
+            )
+            continue
+
+        reason = " ".join(str(item.get("rationale") or "").split())
+        _, rationale = _noted(
+            verdict,
+            "(Graded 'covered'; its own quoted evidence names an exception.)",
+            f"{reason} Excepted: “{_shorten(quote, MAX_BREACH_QUOTE)}”",
+        )
+        _write(
+            run["id"],
+            clause,
+            verdict=verdict,
+            confidence=COVERED_REVIEW_CONFIDENCE,
+            rationale=rationale,
+            evidence=row.get("evidence") or [],
+            retrieval_score=0.0,
+            applied=[],
+            design_id=row.get("designKey") or None,
+        )
+        moved += 1
+    return moved
 
 
 def _render_absent(clauses: list[dict]) -> str:
@@ -2363,11 +2548,6 @@ def _guard(
                 rationale,
             )
 
-    if verdict in CITING_VERDICTS:
-        mismatch = fidelity.subject_mismatch(clause_text, evidence_text)
-        if mismatch:
-            return _demoted(mismatch, rationale)
-
     if verdict == "absent" and best_score < WEAK_RETRIEVAL:
         return _demoted(
             "Nothing relevant was retrieved, so the search may have missed it.", rationale
@@ -2528,6 +2708,18 @@ def _fix_is_a_compliance_claim(verdict: str, rationale: str) -> bool:
 
 #: Control families a security clause might name. Checked against the clause's
 #: own words before a rationale is allowed to say one is unmet.
+#
+# Broader than `fidelity._FAMILIES` on purpose, and kept separate from it. This
+# list only has to recognise a family word a rationale used; being wrong adds a
+# note. `fidelity._FAMILIES` decides whether a clause is enumerating several
+# families at all, and being wrong there rewrites a verdict — so it stays
+# conservative and holds none of the CIA-triad words below.
+#
+# What the two must agree on is synonymy, and they now do: whether a word names
+# a family the clause already covers is asked of `fidelity.synonyms_of`, which
+# is the same grouping `fidelity.controls` reads. Before that, a clause saying
+# "resiliency" answered by a rationale blaming "availability" was addressed by
+# one guard and invented by the other, on the same finding.
 _CONTROL_FAMILIES = (
     "governance",
     "cybersecurity",
@@ -2568,6 +2760,11 @@ def invented_families(rationale: str, clause: dict | None) -> list[str]:
 
     Returns the families that do not, so the caller can say so rather than
     silently rewriting the verdict — the rest of the finding may be sound.
+
+    A clause names a family if it uses any of that family's words, which is why
+    the lookup goes through `fidelity.synonyms_of`: "the design does not address
+    availability" is not an invented requirement against a clause that asked for
+    resiliency, and reading the word literally said it was.
     """
     text = _clause_text(clause).lower()
     if not text:
@@ -2580,8 +2777,18 @@ def invented_families(rationale: str, clause: dict | None) -> list[str]:
     return [
         family
         for family in _CONTROL_FAMILIES
-        if family in low and family not in text
+        if _names(low, family) and not any(_names(text, w) for w in fidelity.synonyms_of(family))
     ]
+
+
+def _names(text: str, word: str) -> bool:
+    """Whether `text` uses `word` as a word, not inside a longer one.
+
+    Substring matching counted "authorisation" as present in "authorisations"
+    and, less harmlessly, read a family out of any word that happened to
+    contain one.
+    """
+    return bool(re.search(rf"\b{re.escape(word)}\b", text))
 
 
 def _clause_text(clause: dict | None) -> str:
@@ -2624,6 +2831,29 @@ def _paperwork_answer_to_a_technical_clause(verdict: str, rationale: str, clause
     return bool(_ARCHITECTURAL_CLAUSE.search(text)) and not _PAPERWORK.search(text)
 
 
+def _raw_answer(raw: dict) -> tuple[str, float, str]:
+    """The model's answer as it arrived, for the replay columns on `finding`.
+
+    Deliberately taken before `_normalise`, not after. `_normalise` is itself
+    one of the things a replay needs to be able to re-run — it promotes a
+    described breach out of "partial" and demotes a rationale that argues
+    against its own verdict — so its output is no more the model's answer than
+    `_guard`'s is.
+
+    Not validated here beyond its types. A verdict this function does not
+    recognise is exactly what someone replaying a prompt change needs to see.
+    """
+    try:
+        confidence = float(raw.get("confidence", 0) or 0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    return (
+        str(raw.get("verdict", "") or "")[:40],
+        confidence,
+        str(raw.get("rationale", "") or "")[:4000],
+    )
+
+
 def _normalise(
     raw: dict, clause: dict | None = None
 ) -> tuple[str, float, str, list[str], list[str]]:
@@ -2651,8 +2881,23 @@ def _normalise(
     # no verified quote behind it is demoted to needs_review exactly as a
     # model-authored one would be. This can make a verdict stricter; it cannot
     # make one unfounded.
-    if verdict == "partial" and _BREACH.search(rationale):
-        verdict = "contradicts"
+    #
+    # Read on the gap sentence alone, for the reason `hedged_breach` reads the
+    # same one: the prompts reserve the last sentence for the fix, and a fix
+    # names the thing to be fixed. "Add a dead-letter queue so failed messages
+    # are not dropped" is a correct remediation on a correct "partial", and
+    # testing the whole rationale let it promote itself to a contradiction.
+    #
+    # The note is not decoration. This is the engine's only rule that makes a
+    # verdict *stricter*, and it used to rewrite the field and say nothing — so
+    # it was the one guard whose firing rate could not be counted after a run,
+    # and a reviewer saw a contradiction the model had never written.
+    if verdict == "partial" and _BREACH.search(fidelity.first_sentence(rationale)):
+        verdict, rationale = _noted(
+            "contradicts",
+            "(Graded 'partial', but the gap describes a breach; recorded as one.)",
+            rationale,
+        )
 
     # The model graded the clause as unmet and then wrote that the design meets
     # it. A finding whose fix says there is nothing to fix is unusable and the
@@ -2839,12 +3084,12 @@ def _render_clause(clause: dict, *, with_force: bool = True, stack_block: str = 
     """The clause as the judge reads it.
 
     `with_force=False` for the copy handed to the guards. They are given this
-    same string as `clause_text`, and `fidelity` tokenises it to decide whether
-    cited evidence is even on the clause's subject — so every word in here
-    becomes a word the evidence may match against.
+    same string as `clause_text`, and `_figure_corroborates` tokenises it to
+    decide whether a diagram is even on the clause's subject — so every word in
+    here becomes a word a figure description may match against.
 
     The obligation line costs seven of them: how, strongly, clause, binds,
-    read, own, wording, none of which are in `fidelity._SUBJECT_STOP`. With it
+    read, own, wording, none of which are in `_STOPWORDS`. With it
     included, a figure description reading "Diagram read by the team showing
     how each service binds to its own queue" corroborated a cryptography
     clause, because `_figure_corroborates` needs two shared keywords and
@@ -3009,13 +3254,25 @@ def _write(
     readings: int = 1,
     agreed: int = 1,
     dissent: list[dict] | None = None,
+    raw: tuple[str, float, str] | None = None,
 ) -> None:
-    """One finding, committed on its own so a crash costs at most one clause."""
+    """One finding, committed on its own so a crash costs at most one clause.
+
+    `raw` is what the model answered before `_normalise` and the guards touched
+    it. Stored beside the finding rather than instead of it: the columns above
+    are what a reviewer reads and must stay post-guard, while these are what a
+    replay needs. Without them a guard or prompt change could only be measured
+    by paying for the whole framework again, because the inputs those functions
+    read had not been kept. Defaults to the final answer, so a path that writes
+    a finding without going through the judge — the absent re-read, the covered
+    review — records the verdict it actually produced rather than an empty one.
+    """
     reference = _reference(clause)
     # Severity is a function of this, so it is recorded with the finding rather
     # than looked up later: the clause behind a report can be sharpened or
     # retired, and a report has to keep explaining its own severities.
     obligation = obligations.resolve(clause, judged_obligation)
+    raw_verdict, raw_confidence, raw_rationale = raw or (verdict, confidence, rationale)
     with db.transaction() as conn:
         db.execute(
             conn,
@@ -3025,8 +3282,9 @@ def _write(
                  "clauseRef","clauseTitle","clauseStatement",
                  "verdict","confidence","rationale","evidence","retrievalScore",
                  "appliedDecisions","obligation","obligationSource",
-                 "readings","agreed","dissent")
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                 "readings","agreed","dissent",
+                 "rawVerdict","rawConfidence","rawRationale")
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT ("runId","clauseId","designKey") DO UPDATE SET
                 "documentId" = EXCLUDED."documentId",
                 "verdict"    = EXCLUDED."verdict",
@@ -3039,7 +3297,10 @@ def _write(
                 "obligationSource" = EXCLUDED."obligationSource",
                 "readings" = EXCLUDED."readings",
                 "agreed" = EXCLUDED."agreed",
-                "dissent" = EXCLUDED."dissent"
+                "dissent" = EXCLUDED."dissent",
+                "rawVerdict" = EXCLUDED."rawVerdict",
+                "rawConfidence" = EXCLUDED."rawConfidence",
+                "rawRationale" = EXCLUDED."rawRationale"
             """,
             (
                 db.new_id(),
@@ -3061,6 +3322,9 @@ def _write(
                 readings,
                 agreed,
                 Jsonb(dissent or []),
+                raw_verdict,
+                raw_confidence,
+                raw_rationale,
             ),
         )
 

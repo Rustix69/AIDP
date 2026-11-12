@@ -24,7 +24,14 @@ What this proves:
 read disagree with the text its quotes were checked against on four other
 paths — `coverage`, `advice`, `lifecycle` and `request_intake` all render the
 raw document and verify against the built one — so every gap quoting a line
-with an arrow in it was silently dropped. The tests went with it.)
+with an arrow in it was silently dropped. The tests went with it.
+
+The arrow problem itself was real and is now fixed the other way round, in
+`normalise` rather than `build` — see `test_quote_repair.py`. That is the
+comparison key, applied to both sides of every comparison, so `render` and the
+four paths above are untouched and the two sides cannot drift apart. Before
+changing it again, read that file's note on why the distinction is the whole
+point.)
 
 No database, no model, no network.
 

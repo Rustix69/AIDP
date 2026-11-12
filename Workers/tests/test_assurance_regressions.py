@@ -109,20 +109,21 @@ for name, prompt in (
     ok(f"{name}: the gap must be a requirement of THIS clause", "of THIS clause" in flat)
     ok(f"{name}: and must be about the clause's own subject", "subject the clause is about" in flat or "clause's own subject" in flat)
 
+# The subject-matter check that used to sit here was removed deliberately.
+# Across every run on record it fired once, and its own gate made it nearly
+# unfireable: it stood down unless the clause and the cited evidence each
+# resolved to exactly one domain and the two differed. Sixty-five lines of
+# lookup tables bought one demotion whose message ("no recognizable subject
+# terms in common") told a reviewer nothing they could act on.
+#
+# What it was reaching for is still enforced, and by the better half: the three
+# prompt assertions above require both judges to answer only on the clause's own
+# subject. Keep it that way — if a finding on the wrong subject ever reaches a
+# report again, the prompt is where it should be caught, not a token overlap.
 ok(
-    "a finding with cited evidence on a different subject is sent for review",
-    "subject_mismatch" in __import__("inspect").getsource(analyse._guard)
-    and analyse.fidelity.subject_mismatch(
-        "Interfaces shall define protocol, payload structure and data format.",
-        "The platform provides regional backups and disaster recovery.",
-    ) is not None,
-)
-ok(
-    "recognized architecture synonyms keep relevant evidence in scope",
-    analyse.fidelity.subject_mismatch(
-        "Interfaces shall define protocol, payload structure and data format.",
-        "The API accepts REST messages encoded as JSON.",
-    ) is None,
+    "the subject-overlap guard stays removed",
+    not hasattr(analyse.fidelity, "subject_mismatch")
+    and "subject_mismatch" not in __import__("inspect").getsource(analyse._guard),
 )
 
 
