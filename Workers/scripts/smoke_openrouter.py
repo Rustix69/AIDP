@@ -109,11 +109,17 @@ def fake_post(url, headers, payload, attempts=4):
     return replies.pop(0) if len(replies) > 1 else replies[0]
 
 
-def reply(content, *, finish="stop", prompt=120, completion=30):
+def reply(content, *, finish="stop", prompt=120, completion=30, cached=None, cache_write=None):
+    usage_block = {"prompt_tokens": prompt, "completion_tokens": completion, "cost": 0.0001}
+    if cached is not None or cache_write is not None:
+        usage_block["prompt_tokens_details"] = {
+            "cached_tokens": cached or 0,
+            "cache_write_tokens": cache_write or 0,
+        }
     return {
         "model": "openai/gpt-4.1-mini",
         "choices": [{"message": {"content": content}, "finish_reason": finish}],
-        "usage": {"prompt_tokens": prompt, "completion_tokens": completion, "cost": 0.0001},
+        "usage": usage_block,
     }
 
 
@@ -145,7 +151,47 @@ ok("zero-data-retention not demanded unless configured", "zdr" not in payload["p
 ok("the verdict is parsed", result == verdict, result)
 ok("the bill is recorded from the response's own counts",
    recorded[-1] == {"kind": "llm", "provider": "openrouter", "model": "openai/gpt-4.1-mini",
-                    "input_tokens": 120, "output_tokens": 30}, recorded[-1])
+                    "input_tokens": 120, "output_tokens": 30,
+                    "cached_tokens": 0, "cache_write_tokens": 0}, recorded[-1])
+ok("a provider that reports no cache breakdown records zeros, not nothing",
+   recorded[-1]["cached_tokens"] == 0 and recorded[-1]["cache_write_tokens"] == 0)
+
+# What the whole-document assessment turns on: the same design is sent once per
+# clause, so whether its tokens were a cache read or a fresh upload is the whole
+# difference between a cheap run and an expensive one — and `inputTokens` reads
+# the same either way. See `usage.cache_from_openai`.
+replies[:] = [reply(json.dumps(verdict), prompt=10339, completion=120,
+                    cached=10318, cache_write=21)]
+client.judge(reference="3.2", clause="MFA required", extracts="E1: MFA everywhere")
+ok("a cached prefix is recorded apart from the input it is part of",
+   recorded[-1]["input_tokens"] == 10339
+   and recorded[-1]["cached_tokens"] == 10318
+   and recorded[-1]["cache_write_tokens"] == 21, recorded[-1])
+ok("and the cached part is not added on top of the input",
+   recorded[-1]["cached_tokens"] <= recorded[-1]["input_tokens"])
+
+# One run's calls have to land on one provider, or each pays to warm its own
+# copy of the same document. OpenRouter's default sticky key is a hash of the
+# first system and first user message — identical system half, different clause
+# every call — so without an explicit session the clauses of one run scatter.
+ok("nothing bound, no session: an unattributed call must not pin the pool",
+   "session_id" not in sent[-1]["payload"], sent[-1]["payload"].get("session_id"))
+
+usage.bind(usage.Attribution(organisation_id="org1", stage="analyse",
+                             document_id="doc1", run_id="run1"))
+try:
+    replies[:] = [reply(json.dumps(verdict))]
+    client.judge(reference="3.2", clause="MFA required", extracts="E1: MFA everywhere")
+    ok("a run's calls carry its id, so they stick to one host's cache",
+       sent[-1]["payload"].get("session_id") == "run1", sent[-1]["payload"].get("session_id"))
+
+    usage.bind(usage.Attribution(organisation_id="org1", stage="chunk", document_id="doc1"))
+    replies[:] = [reply(json.dumps(verdict))]
+    client.judge(reference="3.2", clause="MFA required", extracts="E1: MFA everywhere")
+    ok("a stage with no run falls back to the document it is reading",
+       sent[-1]["payload"].get("session_id") == "doc1", sent[-1]["payload"].get("session_id"))
+finally:
+    usage.bind(None)
 
 replies[:] = [reply('{"sections": [], "labels": [], "rules": []}')]
 raw = client.read_rules(document="0: x", title="T", first=0, last=0, whole=True, attempt=2)

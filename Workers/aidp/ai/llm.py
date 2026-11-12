@@ -2699,12 +2699,15 @@ class AnthropicLLM:
         """
         data = _post(self.BASE, self._headers(), payload)
         input_tokens, output_tokens = usage.from_anthropic(data)
+        cached_tokens, cache_write_tokens = usage.cache_from_anthropic(data)
         usage.record(
             kind="llm",
             provider="anthropic",
             model=str(payload.get("model") or self.model),
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            cached_tokens=cached_tokens,
+            cache_write_tokens=cache_write_tokens,
         )
         return data
 
@@ -2868,12 +2871,15 @@ class AnthropicLLM:
         }
         data = _post(self.BASE, self._headers(), payload, attempts=2)
         input_tokens, output_tokens = usage.from_anthropic(data)
+        cached_tokens, cache_write_tokens = usage.cache_from_anthropic(data)
         usage.record(
             kind="llm",
             provider="anthropic",
             model=self.model,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            cached_tokens=cached_tokens,
+            cache_write_tokens=cache_write_tokens,
         )
         text = self._text_of(data)
         if not text:
@@ -3162,6 +3168,35 @@ class OpenRouterLLM:
             # see `judge_sampling`.
             "seed": seed,
         }
+        # Keep one run's calls on one provider, so the cached document is
+        # actually reused.
+        #
+        # OpenRouter holds a prompt cache per upstream provider and keeps a
+        # conversation on the same one by "sticky routing", whose key is by
+        # default a hash of the first system message and the first non-system
+        # message. That default is exactly wrong for this engine. In a
+        # whole-document assessment the system half — the entire design — is
+        # identical on every call of a run, and the user half is the clause,
+        # which differs on every one. So the sticky key differs on every call,
+        # the hundred-odd clauses of a run scatter across the allowed providers
+        # (`provider.only` lists two), and each one pays to warm its own copy of
+        # the same document.
+        #
+        # An explicit session id replaces that key. Every call of a run then
+        # carries the same one and lands on the same provider, which is what
+        # makes the second clause onward a cache read rather than a fresh
+        # upload. The run id is the right grain: it is exactly the set of calls
+        # that share a document.
+        #
+        # Falls back to the document, for the stages that have no run — parse
+        # and chunk also send one document many times. Omitted entirely when
+        # nothing is bound, which is the smoke scripts, and sending a constant
+        # there would pin every unrelated test to one provider.
+        attribution = usage.current()
+        session = attribution and (attribution.run_id or attribution.document_id)
+        if session:
+            payload["session_id"] = str(session)
+
         accepted = _supported(chosen)
         if accepted is not None:
             for parameter in _OPTIONAL_PARAMS:
@@ -3181,12 +3216,15 @@ class OpenRouterLLM:
             raise RuntimeError(f"openrouter refused the request: {str(data['error'])[:200]}")
 
         input_tokens, output_tokens = usage.from_openai(data)
+        cached_tokens, cache_write_tokens = usage.cache_from_openai(data)
         usage.record(
             kind="llm",
             provider="openrouter",
             model=chosen,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            cached_tokens=cached_tokens,
+            cache_write_tokens=cache_write_tokens,
         )
 
         choices = data.get("choices") or []

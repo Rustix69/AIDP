@@ -99,11 +99,15 @@ _INSERT = """
 INSERT INTO "token_usage" (
     "id", "organisationId", "userId", "documentId", "runId",
     "stage", "kind", "provider", "model",
-    "inputTokens", "outputTokens", "totalTokens", "estimated", "payer", "createdAt"
+    "inputTokens", "outputTokens", "totalTokens",
+    "cachedTokens", "cacheWriteTokens",
+    "estimated", "payer", "createdAt"
 ) VALUES (
     %(id)s, %(org)s, %(user)s, %(doc)s, %(run)s,
     %(stage)s, %(kind)s, %(provider)s, %(model)s,
-    %(input)s, %(output)s, %(total)s, %(estimated)s, %(payer)s, %(now)s
+    %(input)s, %(output)s, %(total)s,
+    %(cached)s, %(cache_write)s,
+    %(estimated)s, %(payer)s, %(now)s
 )
 """
 
@@ -135,10 +139,20 @@ def record(
     model: str,
     input_tokens: int = 0,
     output_tokens: int = 0,
+    cached_tokens: int = 0,
+    cache_write_tokens: int = 0,
     estimated: bool = False,
     run_id: str | None = None,
 ) -> None:
     """Write one usage row against the bound attribution.
+
+    `cached_tokens` and `cache_write_tokens` are a breakdown *inside*
+    `input_tokens`, not an addition to it — every provider here reports the
+    cached part within its prompt count, so adding them would double-count a
+    cached run. They are recorded separately because they are billed at a
+    different rate: a read is a quarter to a half of ordinary input, so a run
+    whose document is cached costs a fraction of the same run uncached, and
+    `inputTokens` alone cannot tell those two apart.
 
     Silently does nothing when nothing is bound. That is the case for the smoke
     tests and any script that calls the AI modules directly, and those have no
@@ -166,6 +180,8 @@ def record(
                     "input": max(0, int(input_tokens)),
                     "output": max(0, int(output_tokens)),
                     "total": max(0, int(input_tokens)) + max(0, int(output_tokens)),
+                    "cached": max(0, int(cached_tokens)),
+                    "cache_write": max(0, int(cache_write_tokens)),
                     "estimated": estimated,
                     "payer": _payer(kind),
                     "now": db.now(),
@@ -219,6 +235,20 @@ def from_anthropic(data: dict) -> tuple[int, int]:
     return inputs, int(usage.get("output_tokens") or 0)
 
 
+def cache_from_anthropic(data: dict) -> tuple[int, int]:
+    """(cache read, cache write) from an Anthropic response.
+
+    The mirror of `cache_from_openai`, and the same breakdown relationship:
+    `from_anthropic` already folds both of these into its input figure, so
+    these are a part of that number rather than more on top of it.
+    """
+    usage = data.get("usage") or {}
+    return (
+        int(usage.get("cache_read_input_tokens") or 0),
+        int(usage.get("cache_creation_input_tokens") or 0),
+    )
+
+
 def from_openai(data: dict) -> tuple[int, int]:
     """(input, output) from an OpenAI-shaped response — OpenRouter's included.
 
@@ -227,3 +257,27 @@ def from_openai(data: dict) -> tuple[int, int]:
     """
     usage = data.get("usage") or {}
     return int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0)
+
+
+def cache_from_openai(data: dict) -> tuple[int, int]:
+    """(cache read, cache write) from an OpenAI-shaped response.
+
+    Both live under `usage.prompt_tokens_details` and both are a breakdown of
+    `prompt_tokens`, not an addition to it — so these are recorded beside the
+    input figure rather than summed into it.
+
+    This is the number the whole-document assessment turns on. Every clause of
+    a run sends the same document as its cached prefix, so on a 170-clause run
+    the document is paid for either once or a hundred and seventy times, and
+    `inputTokens` reads identically in both cases. Without this the only
+    honest thing that could be said about a run's cost was a multiplication.
+
+    Returns zeros when the provider reports nothing, which is also what a run
+    with no cache hit looks like. The two are not distinguished here: a
+    provider that never reports and a cache that never hits cost the same.
+    """
+    details = (data.get("usage") or {}).get("prompt_tokens_details") or {}
+    return (
+        int(details.get("cached_tokens") or 0),
+        int(details.get("cache_write_tokens") or 0),
+    )

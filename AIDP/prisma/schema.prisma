@@ -351,6 +351,19 @@ model TokenUsage {
   outputTokens Int @default(0)
   totalTokens  Int @default(0)
 
+  /// The part of `inputTokens` the provider served from its prompt cache, and
+  /// the part it wrote into that cache. A breakdown of the input figure, never
+  /// an addition to it.
+  ///
+  /// Recorded because input alone cannot price a run. A whole-document
+  /// assessment sends the same design as a cached prefix once per clause, so
+  /// on a 170-clause run the document is billed either once or 170 times and
+  /// `inputTokens` reads the same either way — while a cache read costs a
+  /// quarter to a half of ordinary input. Zero means the provider reported
+  /// nothing or nothing hit; the two are not told apart here.
+  cachedTokens     Int @default(0)
+  cacheWriteTokens Int @default(0)
+
   /// True when the provider returned no usage figures and these were derived
   /// from input size — every embedding endpoint here does that. Flagged rather
   /// than blended in, so a spend figure can say how much of itself is a guess.
