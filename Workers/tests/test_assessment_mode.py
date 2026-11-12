@@ -38,10 +38,21 @@ No database and no model: `db.connection` and `whole_document.load` are stubbed.
 from __future__ import annotations
 
 import contextlib
+import os
 import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+
+# What "auto" resolves to is a deployment setting, and this file is about what
+# `_resolve_mode` does with each answer — not about which one this machine
+# happens to prefer. Pinned before `aidp.config` is imported, because that
+# module calls `load_dotenv()` at import and `.env` is where the deployment
+# sets it; `load_dotenv` leaves an existing variable alone, so this wins.
+#
+# Without it, turning whole-document reading off in .env failed six assertions
+# here that have nothing to do with the setting.
+os.environ.setdefault("PREFER_WHOLE_DOCUMENT", "on")
 
 from aidp import designs, whole_document  # noqa: E402
 from aidp.config import get_config  # noqa: E402
