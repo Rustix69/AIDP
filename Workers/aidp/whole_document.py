@@ -76,6 +76,22 @@ def normalise(text: str) -> str:
     return " ".join(_WORD.findall(_CORRUPT_GLYPH.sub(" ", folded)))
 
 
+def readable(text: str) -> str:
+    """A quote with the parts that are not text taken out, for showing a person.
+
+    `normalise` throws away everything but words, which is right for comparing
+    and useless for quoting: a reviewer is shown the model's quote beside the
+    clause and needs its punctuation. This keeps all of that and removes only
+    what a reader cannot be shown — the control character a model writes where
+    the document has an arrow, and the digits it brings with it.
+
+    Used where a quote matched on words rather than characters. The result is
+    the model's rendering of the passage, not the document's own: the words are
+    the design's and in its order, the punctuation may be the model's.
+    """
+    return " ".join(_CORRUPT_GLYPH.sub(" ", text or "").split())
+
+
 @dataclass
 class Check:
     """Whether a quote is in the document, and where."""

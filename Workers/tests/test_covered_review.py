@@ -50,6 +50,7 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
+from aidp import obligations  # noqa: E402
 from aidp.stages import analyse  # noqa: E402
 
 passed = 0
@@ -95,7 +96,17 @@ EVIDENCE = [
     }
 ]
 
-ROW = {"clauseId": SEC_006["id"], "designKey": None, "evidence": EVIDENCE, "rationale": "..."}
+ROW = {
+    "clauseId": SEC_006["id"],
+    "designKey": None,
+    "evidence": EVIDENCE,
+    "rationale": "...",
+    # The force of this clause as the first reading established it. On a real
+    # search run 18 of 36 covered findings carried exactly this: a "must" that
+    # only the judge could read, because the clause states none of its own.
+    "obligation": "must",
+    "obligationSource": "judge",
+}
 BATCH = [(SEC_006, ROW)]
 
 written: list[dict] = []
@@ -143,6 +154,48 @@ ok(
 ok(
     "at the confidence of a second reading, not the first",
     written and written[0]["confidence"] == analyse.COVERED_REVIEW_CONFIDENCE,
+)
+
+print("\nA demotion keeps the obligation the finding was carrying")
+# Severity is a function of obligation, and `_write` re-resolves it from the
+# clause. A clause stating none of its own — which is why the judge read it —
+# would come back "unstated" from a pass that did not hand the reading back,
+# and the finding's severity would collapse on the one write telling a reviewer
+# to look harder.
+ok(
+    "the judge's reading is handed back to _write",
+    written and written[0]["judged_obligation"] == "must",
+    written and written[0].get("judged_obligation"),
+)
+ok(
+    "a reading this engine made itself is not",
+    analyse._carried_obligation({"obligation": "must", "obligationSource": "read"}) == "",
+)
+ok(
+    "nor is a parsed one, which resolve prefers anyway",
+    analyse._carried_obligation({"obligation": "should", "obligationSource": "parsed"}) == "",
+)
+ok(
+    "and a row carrying nothing says nothing",
+    analyse._carried_obligation({}) == "",
+)
+# The end that matters: what `_write` would actually store.
+PLAIN = {"title": "Platform note", "statement": "The platform is described in section 4.",
+         "requirements": []}
+OWN = {"title": "MFA", "statement": "MFA shall be enforced for all privileged access.",
+       "requirements": []}
+ok(
+    "a clause with no force of its own keeps the judge's",
+    obligations.resolve(PLAIN, analyse._carried_obligation(ROW)).strength == "must",
+)
+ok(
+    "and without it would have been unstated — the bug",
+    obligations.resolve(PLAIN, "").strength == "unstated",
+)
+ok(
+    "a clause that states its own force is unaffected either way",
+    obligations.resolve(OWN, "may").strength == "must"
+    and obligations.resolve(OWN, "").strength == "must",
 )
 
 print("\nAn exception it cannot quote is not an exception")
@@ -226,6 +279,37 @@ print("\nA finding with no verified evidence is not reviewed")
 ok("no excerpts means nothing to check", analyse._excerpts([]) == [])
 ok("a blank excerpt does not count", analyse._excerpts([{"excerpt": "   "}]) == [])
 ok("neither does a non-dict item", analyse._excerpts(["text"]) == [])
+
+print("\nBatches are sized by how much text they carry")
+BIG = {**ROW, "evidence": [{"excerpt": "x" * 9000}]}
+SMALL = {**ROW, "evidence": [{"excerpt": "y" * 100}]}
+# Over the budget on its own, which is the case the loop has to not split.
+HUGE = {**ROW, "evidence": [{"excerpt": "z" * (analyse.COVERED_REVIEW_BUDGET + 3000)}]}
+ok(
+    "small findings share a call",
+    len(analyse._covered_batches([(SEC_006, SMALL)] * 8)) == 1,
+)
+ok(
+    "the budget closes a batch before the count does",
+    len(analyse._covered_batches([(SEC_006, BIG)] * 3)) == 3,
+)
+ok(
+    "a single finding over the budget still goes, alone",
+    [len(b) for b in analyse._covered_batches([(SEC_006, HUGE), (SEC_006, SMALL)])] == [1, 1],
+)
+ok(
+    "two under-budget findings still share one",
+    len(analyse._covered_batches([(SEC_006, BIG), (SEC_006, SMALL)])) == 1,
+)
+ok(
+    "and the count still caps a batch of tiny ones",
+    max(len(b) for b in analyse._covered_batches([(SEC_006, SMALL)] * 60))
+    <= analyse.CONFIRM_BATCH,
+)
+ok(
+    "nothing is dropped or duplicated",
+    sum(len(b) for b in analyse._covered_batches([(SEC_006, SMALL)] * 60)) == 60,
+)
 
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)

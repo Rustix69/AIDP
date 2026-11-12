@@ -41,7 +41,8 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from aidp import whole_document as wd  # noqa: E402
+from aidp import retrieval, whole_document as wd  # noqa: E402
+from aidp.stages import analyse  # noqa: E402
 
 passed = 0
 failed = 0
@@ -122,6 +123,54 @@ ok(
 ok(
     "and contains() reads both sides the same way",
     wd.contains(PAGE, "Web/mobile \x0216 API Gateway"),
+)
+
+print("\nA breaching quote is matched on words, not characters")
+# `_mark_breach` was the one quote check that did not go through this module.
+# Character-for-character cost it 11 of 37 contradictions on one real run and
+# 9 of 9 on another, and a dropped breach quote takes the drawn table with it:
+# FindingModal skips any passage that has none.
+ROW_EXTRACT = (
+    "MERIDIAN ONE > 8 Security Architecture\n"
+    "Authentication | MFA is enforced for corporate SSO, AWS console and remote VPN. "
+    "Legacy operations console has username/password authentication."
+)
+
+
+def marked(quote: str) -> str | None:
+    """What `_mark_breach` stores for this quote, or None if it refused it."""
+    candidate = retrieval.Candidate(
+        chunk_id="x1", heading_path="h", text=ROW_EXTRACT, page_start=7,
+        score=1.0, vector_rank=1, lexical_rank=1,
+    )
+    evidence = [{"chunkId": "x1"}]
+    analyse._mark_breach(evidence, {"extract": "x1", "quote": quote}, {"x1": candidate})
+    return evidence[0].get("breachQuote")
+
+
+ok(
+    "an exact quote is marked, as before",
+    marked("Legacy operations console has username/password authentication") is not None,
+)
+ok(
+    "a table row the model re-rendered is marked",
+    marked("Authentication - MFA is enforced for corporate SSO") is not None,
+)
+ok(
+    "so is one carrying the corruption",
+    marked("MFA is enforced \x0216 for corporate SSO, AWS console") is not None,
+)
+ok(
+    "and what is stored has no control character in it",
+    "\x02" not in (marked("MFA is enforced \x0216 for corporate SSO, AWS console") or ""),
+)
+ok(
+    "a paraphrase is still refused",
+    marked("The legacy console does not require multi-factor authentication") is None,
+)
+ok(
+    "words of the extract in the wrong order are still refused",
+    marked("authentication username/password has console operations Legacy") is None,
 )
 
 print(f"\n{passed} passed, {failed} failed")

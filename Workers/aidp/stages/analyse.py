@@ -1793,7 +1793,8 @@ def _demote_unconfirmed(run: dict, clauses: list[dict], why: str) -> int:
         with db.connection() as conn:
             rows = db.query(
                 conn,
-                'SELECT "clauseId", "designKey", "confidence", "rationale" FROM "finding" '
+                'SELECT "clauseId", "designKey", "confidence", "rationale", '
+                '"obligation", "obligationSource" FROM "finding" '
                 'WHERE "runId" = %s AND "verdict" = %s AND "confidence" < %s',
                 (run["id"], "absent", CONFIRM_REQUIRED_CONFIDENCE),
             )
@@ -1819,6 +1820,7 @@ def _demote_unconfirmed(run: dict, clauses: list[dict], why: str) -> int:
                 evidence=[],
                 retrieval_score=0.0,
                 applied=[],
+                judged_obligation=_carried_obligation(row),
                 design_id=row.get("designKey") or None,
             )
         except Exception as exc:  # noqa: BLE001 — one clause must not sink the rest
@@ -1860,7 +1862,8 @@ def _confirm(run: dict, clauses: list[dict], scope: designs.Scope) -> None:
         # is.
         rows = db.query(
             conn,
-            'SELECT "clauseId", "documentId", "verdict", "rationale" FROM "finding" '
+            'SELECT "clauseId", "documentId", "verdict", "rationale", '
+            '"obligation", "obligationSource" FROM "finding" '
             'WHERE "runId" = %s AND "verdict" = ANY(%s)',
             (run["id"], ["absent", "partial", "not_assessable"]),
         )
@@ -1873,6 +1876,15 @@ def _confirm(run: dict, clauses: list[dict], scope: designs.Scope) -> None:
         return
 
     by_id = {clause["id"]: clause for clause in clauses}
+    # The obligation each row is carrying, so a verdict this pass overturns
+    # keeps it. `outstanding` below is clauses, not findings, so without this
+    # the row's own reading is gone by the time `_write` is called — see
+    # `_carried_obligation`. Keyed by design as well as clause because an
+    # alternatives run holds one row per candidate design.
+    carried = {
+        (row["clauseId"], str(row.get("documentId") or "")): _carried_obligation(row)
+        for row in candidates
+    }
     if scope.alternatives:
         # Every alternative owns a separate result row. Re-read omissions only
         # against the document that row belongs to; another candidate cannot
@@ -1904,6 +1916,7 @@ def _confirm(run: dict, clauses: list[dict], scope: designs.Scope) -> None:
                     whole,
                     design,
                     unit_scope,
+                    carried=carried,
                     design_id=design.document_id,
                 )
         return
@@ -1947,7 +1960,7 @@ def _confirm(run: dict, clauses: list[dict], scope: designs.Scope) -> None:
         for start_at in range(0, len(outstanding), CONFIRM_BATCH):
             batch = outstanding[start_at : start_at + CONFIRM_BATCH]
             raw = llm.confirm_absent(document=whole.text, clauses=_render_absent(batch))
-            answered |= _adopt_confirmations(run, batch, raw, whole, design, scope)
+            answered |= _adopt_confirmations(run, batch, raw, whole, design, scope, carried=carried)
         changed += len(answered)
         outstanding = [clause for clause in outstanding if clause["id"] not in answered]
 
@@ -1968,6 +1981,16 @@ def _confirm(run: dict, clauses: list[dict], scope: designs.Scope) -> None:
 #: the conclusion drawn from it. Two readings of one text, and the report should
 #: not present the second as the more certain.
 COVERED_REVIEW_CONFIDENCE = 0.6
+
+#: How much evidence text one covered-review call carries, in characters.
+#:
+#: Measured, not guessed. A whole-document run's covered findings average 471
+#: characters of evidence each, so this leaves that mode batching at
+#: `CONFIRM_BATCH` as it did. A search run's average 1,951 and reach 6,904, so
+#: it splits those into calls of six or so — which is the point, because the
+#: model has to read each clause against its own passage rather than skim
+#: twenty-five of them.
+COVERED_REVIEW_BUDGET = 12_000
 
 
 def _review_covered(run: dict, clauses: list[dict]) -> None:
@@ -2002,7 +2025,8 @@ def _reconsider_covered(run: dict, clauses: list[dict]) -> None:
     with db.connection() as conn:
         rows = db.query(
             conn,
-            'SELECT "clauseId", "designKey", "evidence", "rationale" FROM "finding" '
+            'SELECT "clauseId", "designKey", "evidence", "rationale", '
+            '"obligation", "obligationSource" FROM "finding" '
             'WHERE "runId" = %s AND "verdict" = %s',
             (run["id"], "covered"),
         )
@@ -2020,15 +2044,51 @@ def _reconsider_covered(run: dict, clauses: list[dict]) -> None:
         return
 
     moved = 0
-    for start_at in range(0, len(pending), CONFIRM_BATCH):
-        batch = pending[start_at : start_at + CONFIRM_BATCH]
+    batches = _covered_batches(pending)
+    for batch in batches:
         raw = llm.review_covered(clauses=_render_covered(batch))
         moved += _adopt_covered_review(run, batch, raw)
 
     logs.info(
         log, "covered findings reviewed against their own evidence",
-        runId=run["id"], reviewed=len(pending), moved=moved,
+        runId=run["id"], reviewed=len(pending), batches=len(batches), moved=moved,
     )
+
+
+def _covered_batches(pending: list[tuple[dict, dict]]) -> list[list[tuple[dict, dict]]]:
+    """Split the pending findings into calls, by how much text each carries.
+
+    `CONFIRM_BATCH` alone is the wrong measure here, and it is worth saying why
+    rather than leaving the next reader to assume it was copied carelessly. The
+    absent re-read it was chosen for sends the document once and then that many
+    *short* clause renders; this sends each clause together with all of its own
+    evidence, and in search mode that evidence is chunk text rather than a
+    verified sentence. Rendering the real pending set of a search run at 25 gave
+    one call of 49,338 characters, with a single finding carrying 6,904 of them.
+
+    That fits the context window and costs about a cent, so this is not about
+    either. It is about what the pass is for: a question narrow enough that the
+    model reads one clause against one short passage and answers it. Twenty-five
+    clauses of section text is how that turns back into the skim this exists to
+    correct.
+
+    So a batch closes on whichever comes first, the character budget or
+    `CONFIRM_BATCH`. A single finding larger than the budget still goes, alone —
+    splitting its evidence would ask the model about half the proof.
+    """
+    batches: list[list[tuple[dict, dict]]] = []
+    batch: list[tuple[dict, dict]] = []
+    size = 0
+    for item in pending:
+        cost = sum(len(text) for text in _excerpts(item[1].get("evidence")))
+        if batch and (size + cost > COVERED_REVIEW_BUDGET or len(batch) >= CONFIRM_BATCH):
+            batches.append(batch)
+            batch, size = [], 0
+        batch.append(item)
+        size += cost
+    if batch:
+        batches.append(batch)
+    return batches
 
 
 def _excerpts(evidence) -> list[str]:
@@ -2114,6 +2174,7 @@ def _adopt_covered_review(run: dict, batch: list[tuple[dict, dict]], raw: dict) 
             evidence=row.get("evidence") or [],
             retrieval_score=0.0,
             applied=[],
+            judged_obligation=_carried_obligation(row),
             design_id=row.get("designKey") or None,
         )
         moved += 1
@@ -2149,6 +2210,7 @@ def _adopt_confirmations(
     design: designs.Design,
     scope: designs.Scope,
     *,
+    carried: dict[tuple[str, str], str] | None = None,
     design_id: str | None = None,
 ) -> set[str]:
     """Rewrite the findings this design's re-read overturned, and only those.
@@ -2222,10 +2284,40 @@ def _adopt_confirmations(
             ],
             retrieval_score=0.0,
             applied=[],
+            judged_obligation=(carried or {}).get((clause["id"], design_id or ""), ""),
             design_id=design_id,
         )
         answered.add(clause["id"])
     return answered
+
+
+def _carried_obligation(row: dict) -> str:
+    """The obligation a rewritten finding has to be handed back, or "".
+
+    `_write` resolves the obligation through `obligations.resolve`, which
+    prefers this engine's own reading — the strength the parser recorded, or a
+    modal verb in the clause's own words — and falls back to the judge's only
+    where the clause establishes nothing. That fallback is the whole problem
+    here: every path that rewrites a finding reads the row, builds a new
+    verdict and calls `_write` without the judge's answer, so `resolve` finds
+    nothing to fall back to and returns "unstated".
+
+    Severity is a function of obligation. So a clause whose force only the
+    judge could read came out of a demotion with its `must` replaced by
+    "unstated" and its severity collapsed — on the one write where a reviewer
+    is being asked to look harder, not less. On a real search run 59 of 170
+    findings rested on the judge's reading, and 18 of the 36 "covered" ones
+    did, every one of them "must": exactly the rows `_reconsider_covered`
+    re-reads.
+
+    Returns "" for any other source, which is correct rather than merely safe:
+    where the clause states its own obligation `resolve` ignores this argument
+    anyway, so handing back a parsed or read strength would be noise that could
+    only mislead the next person to read it.
+    """
+    if str(row.get("obligationSource") or "") != obligations.JUDGE:
+        return ""
+    return str(row.get("obligation") or "")
 
 
 def _page_number(value) -> int | None:
@@ -3205,13 +3297,38 @@ def _mark_breach(
     # Compared against `excerpt`, which is the text `_render_extracts` put in
     # front of the model — not the stored chunk, which may differ from it.
     haystack = " ".join(candidate.excerpt.split()).casefold()
+    marked = quote
     if quote.casefold() not in haystack:
-        logs.info(log, "breaching quote is not inside its extract", extract=extract)
-        return
+        # Character-for-character was the whole test, and it was costing a third
+        # of the quotes it was given: 11 of 37 contradictions on one real run,
+        # 9 of 9 on another. The words were the design's every time; what
+        # differed was punctuation, and most often a table row the model had
+        # re-rendered — an em dash where the extract has a pipe, the heading
+        # prefix dropped.
+        #
+        # A dropped quote costs more than the side-by-side it was written for.
+        # `designVoices` in FindingModal.tsx skips any passage without one, so
+        # the cited table row never reaches `rowCells` and the reviewer is shown
+        # the parser's run-on line instead of the drawn row.
+        #
+        # So fall back to the comparison every other quote check in the engine
+        # already uses. It is not a weaker guarantee: `contains` requires the
+        # words in order inside this extract, which a paraphrase cannot satisfy
+        # — only the characters between them are forgiven.
+        if not whole_document.contains(candidate.excerpt, quote):
+            logs.info(log, "breaching quote is not inside its extract", extract=extract)
+            return
+        # Shown to a person, so the control characters go; see `readable`. The
+        # stored quote is then the model's rendering of the passage rather than
+        # the document's own punctuation, which is the trade this fallback makes.
+        marked = whole_document.readable(quote)
+        logs.info(
+            log, "breaching quote matched on words, not characters", extract=extract
+        )
 
     for item in evidence:
         if item.get("chunkId") == extract:
-            item["breachQuote"] = quote[:MAX_BREACH_QUOTE]
+            item["breachQuote"] = marked[:MAX_BREACH_QUOTE]
             return
 
 
