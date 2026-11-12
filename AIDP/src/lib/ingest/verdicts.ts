@@ -883,11 +883,67 @@ function splitSentences(rationale: string): string[] {
  * before. It earns its place by being true rather than by the count — one of
  * the four is a breach a customer is reading right now.
  */
+/**
+ * The literal part label, where the judge wrote one into its own prose.
+ *
+ * Rule 8 asks for "GAP — … IMPACT — … FIX — …", and a judge following it
+ * closely sometimes emits that scaffolding verbatim: "FIX — Implement explicit
+ * compliance monitoring, reporting and corrective action tracking." Two things
+ * then go wrong at once. The sentence no longer opens with its verb, so
+ * `FIX_OPENING` declines it and a rationale carrying all three parts renders
+ * as the unlabelled paragraph the labels exist to break up; and where the
+ * split does land on three sentences, the row prints its own label twice —
+ * "Gap: GAP — the design…".
+ *
+ * Measured over the runs since the three-part rule landed: 105 findings carry
+ * a label in their prose, 29 of them in the three-sentence shape that renders
+ * doubled.
+ *
+ * Stripped rather than split on. The sentence boundaries are still what the
+ * prompt actually constrains — the label is scaffolding the judge was never
+ * asked to print, and taking it off leaves exactly the sentence that was
+ * meant. Every label this file can apply is matched, not only rule 8's three,
+ * because `covered` and `not_assessable` findings are written to the same
+ * shape under different names.
+ *
+ * A separator is required, so an ordinary sentence opening "To resolve, obtain
+ * the approval record" is left alone: only "To resolve —" is a label.
+ */
+const PART_LABEL =
+  /^(?:gap|impact|fix|missing|why\s+it\s+blocks|to\s+resolve|requirement|evidence|alignment)\s*[-\u2013\u2014:]+\s*/i;
+
+/** A sentence with its printed label removed. See `PART_LABEL`. */
+function withoutPartLabel(sentence: string): string {
+  const stripped = sentence.replace(PART_LABEL, "").trim();
+  // A sentence that was nothing but its label keeps its text, so that a
+  // stray "FIX —" is rendered rather than silently becoming an empty row.
+  return stripped || sentence.trim();
+}
+
+/**
+ * The same remedies, written as a gerund rather than an order.
+ *
+ * "Completing and documenting placement override assessments… will satisfy the
+ * clause." "Adding an explicit intended audience section… would satisfy the
+ * clause." Both are remedies by any reading, and the imperative list below
+ * does not reach them because the judge named the action instead of ordering
+ * it. Ten of this workspace's unlabelled findings are that shape.
+ *
+ * Spelled out rather than derived from the verbs below: those stems take three
+ * different endings — add/adding, define/defining, submit/submitting — and a
+ * rule that guessed between them would match words that are not verbs at all.
+ */
+const FIX_GERUND =
+  /^(?:adding|defining|documenting|specifying|implementing|providing|establishing|including|recording|aligning|obtaining|introducing|applying|creating|updating|replacing|restricting|migrating|remediating|removing|enabling|configuring|capturing|publishing|approving|extending|completing)\b/i;
+
 const FIX_OPENING =
   /^(?:to\s+(?:satisfy|comply|close|remediate|address)\b|(?:the\s+)?(?:fix|remedy|resolution|remediation)\s+(?:is|would\s+be|here\s+is)\b|(?:the\s+)?(?:design|document|team|project)\s+(?:must|should|needs\s+to|will\s+need)\b|(?:add|define|document|specify|implement|provide|establish|include|record|align|obtain|introduce|apply|create|update|replace|restrict|migrate|remediate|remove|enable|configure|capture|publish|approve|extend)\b)/i;
 
 function looksLikeFix(sentence: string): boolean {
-  return FIX_OPENING.test(sentence.trim());
+  // The printed label comes off first, so that "FIX — Implement…" is read as
+  // the remedy it is rather than as a sentence opening with the word "fix".
+  const text = withoutPartLabel(sentence);
+  return FIX_OPENING.test(text) || FIX_GERUND.test(text);
 }
 
 /**
@@ -895,15 +951,19 @@ function looksLikeFix(sentence: string): boolean {
  *
  * Rule 8 of the clause prompt asks for GAP, IMPACT and FIX as three sentences
  * on a breach, and rule 7 asks for one sentence everywhere else — so a single
- * sentence is usually the judge doing as it was told, not a failure. What the
- * stored findings show is that the three-part shape mostly does not arrive:
- * of 851 findings on verdicts that ask for it, 69 have three sentences. The
- * rest are one or two, and no amount of splitting invents an impact the judge
- * never wrote.
+ * sentence is usually the judge doing as it was told, not a failure.
  *
- * So this labels what is genuinely there and refuses to guess at the rest.
- * Nothing is dropped either way: a rationale with no labels is rendered as the
- * paragraph it is.
+ * This function was written when the stored findings said the three-part shape
+ * mostly did not arrive — 69 of 851 on the verdicts that ask for it. That
+ * measurement is stale and was taken across runs that predate the rule. Over
+ * the 1,000 breach findings since it landed, 724 arrive as three sentences and
+ * a further 83 as a longer shape whose last sentence is the fix.
+ *
+ * What remains unlabelled is now mostly a judge that ended on something other
+ * than a remedy — the gap restated, or an impact with no fix after it — and no
+ * amount of splitting invents a fix that was never written. So this labels
+ * what is genuinely there and refuses to guess at the rest. Nothing is dropped
+ * either way: a rationale with no labels is rendered as the paragraph it is.
  */
 export function rationaleSections(
   rationale: string,
@@ -913,7 +973,10 @@ export function rationaleSections(
   // "Gap"/"Fix" over an API error is the engine speaking in a reviewer's voice.
   if (notJudged(rationale)) return null;
 
-  const sentences = splitSentences(rationale);
+  // Labels off before anything is counted or tested: the count is unchanged by
+  // stripping, `looksLikeFix` can then see the verb, and no row renders its own
+  // label twice. See `PART_LABEL`.
+  const sentences = splitSentences(rationale).map(withoutPartLabel);
   const labels = rationaleLabels(verdict);
   const [gap, impact, fix] = labels;
 
