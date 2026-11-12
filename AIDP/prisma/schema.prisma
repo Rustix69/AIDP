@@ -1626,6 +1626,22 @@ model Finding {
   /// on top of weak retrieval is the failure this exists to catch.
   retrievalScore Float @default(0)
 
+  /// What the model answered, before any guard touched it.
+  ///
+  /// Everything above is post-guard: `_normalise` may have promoted a breach,
+  /// `_guard` may have demoted the verdict and prepended its reason to the
+  /// rationale. That is the right thing to show a reviewer and the wrong thing
+  /// to keep as the only record, because it meant no guard or prompt change
+  /// could be replayed against findings already stored — the inputs those
+  /// functions read were gone. Every experiment cost a full run of the
+  /// framework, which on the client corpus is 170 model calls.
+  ///
+  /// Empty and 0 where a finding predates this, which is distinguishable from
+  /// a real answer: no model returns an empty verdict.
+  rawVerdict    String @default("")
+  rawConfidence Float  @default(0)
+  rawRationale  String @default("")
+
   /// How many independent readings of this clause were taken, and how many of
   /// them reached the verdict above.
   ///
