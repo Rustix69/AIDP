@@ -1294,9 +1294,26 @@ _DOCUMENT_VERDICT_SCHEMA = {
         # only worth anything if they happen before the answer is committed to.
         # Never read back; `_normalise` takes the fields it needs by name.
         "internal_architect_reasoning": {"type": "string"},
+        # All seven, as in _VERDICT_SCHEMA. The two at the end were missing
+        # here while the prompt above spent rules 5a, 5a-i, 5a-ii, 5b, 5c and
+        # 5d teaching the model when to use them — and a strict schema wins
+        # that argument every time. OpenRouter sends `strict: true` with
+        # `require_parameters`, Gemini sends this as `responseSchema`, so the
+        # model could only choose among five and a clause whose subject is a
+        # record it would not carry had to come back "absent" or
+        # "contradicts": the exact two outcomes rule 5a exists to prevent, and
+        # "absent" then spent a `confirm_absent` re-read to arrive nowhere.
         "verdict": {
             "type": "string",
-            "enum": ["covered", "partial", "absent", "contradicts", "needs_review"],
+            "enum": [
+                "covered",
+                "partial",
+                "absent",
+                "contradicts",
+                "needs_review",
+                "not_assessable",
+                "not_applicable",
+            ],
         },
         "confidence": {"type": "number"},
         "rationale": {"type": "string"},
