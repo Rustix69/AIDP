@@ -24,6 +24,37 @@ def _int(name: str, default: int) -> int:
     return int(raw) if raw else default
 
 
+#: What counts as "no" in an environment variable. Everything else is yes.
+_OFF = ("0", "off", "false", "no")
+
+
+def _flag(name: str, default: bool) -> bool:
+    """A boolean knob, where **unset and empty both mean the default**.
+
+    This was written inline six times as
+
+        os.environ.get("PREFER_WHOLE_DOCUMENT", "on").lower() not in _OFF
+
+    which reads correctly and is wrong for one value: the empty string is not in
+    `_OFF`, so `PREFER_WHOLE_DOCUMENT=` evaluated to **True**. Empty meant "on",
+    not "default" and not "off" — the opposite of what anyone setting a variable
+    to nothing intends.
+
+    That is not hypothetical. `docker-compose.yml` passes
+    `PREFER_WHOLE_DOCUMENT: ${PREFER_WHOLE_DOCUMENT:-}`, which is empty whenever
+    compose is run somewhere that `Workers/.env` is not interpolated from — a
+    different working directory, a recreate with the file out of scope. The
+    knob's own comment in `.env` prices the accident: whole-document mode billed
+    11,134 input tokens a call across 382 calls, 84% of a $2.03 run. A run would
+    silently cost several times what it was meant to, and nothing would say so.
+
+    `_int` above already got this right (`int(raw) if raw else default`). This is
+    the same rule for flags, in one place rather than six.
+    """
+    raw = os.environ.get(name)
+    return default if not raw else raw.strip().lower() not in _OFF
+
+
 # Which key selects which provider, in the order they are tried.
 _PROVIDER_KEYS = (
     ("gemini", ("GEMINI_API_KEY", "GOOGLE_API_KEY")),
@@ -259,26 +290,20 @@ class Config:
             or os.environ.get("GOOGLE_API_KEY"),
             gemini_model=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
             gemini_thinking_budget=_int("GEMINI_THINKING_BUDGET", 0),
-            contextual_preambles=os.environ.get("CONTEXTUAL_PREAMBLES", "on").lower()
-            not in ("0", "off", "false", "no"),
-            rules_by_model=os.environ.get("RULES_BY_MODEL", "on").lower()
-            not in ("0", "off", "false", "no"),
+            contextual_preambles=_flag("CONTEXTUAL_PREAMBLES", True),
+            rules_by_model=_flag("RULES_BY_MODEL", True),
             rules_readings=max(1, min(2, _int("RULES_READINGS", 2))),
             judge_readings=max(1, min(5, _int("JUDGE_READINGS", 3))),
             assess_concurrency=max(1, min(32, _int("ASSESS_CONCURRENCY", 8))),
-            prefer_whole_document=os.environ.get("PREFER_WHOLE_DOCUMENT", "on").lower()
-            not in ("0", "off", "false", "no"),
+            prefer_whole_document=_flag("PREFER_WHOLE_DOCUMENT", True),
             whole_document_max_tokens=max(1_000, _int("WHOLE_DOCUMENT_MAX_TOKENS", 250_000)),
             coverage_reads=max(1, min(5, _int("COVERAGE_READS", 3))),
-            improvement_suggestions=os.environ.get("IMPROVEMENT_SUGGESTIONS", "on").lower()
-            not in ("0", "off", "false", "no"),
+            improvement_suggestions=_flag("IMPROVEMENT_SUGGESTIONS", True),
             advice_cache_days=max(0, _int("ADVICE_CACHE_DAYS", 90)),
-            lifecycle_check=os.environ.get("LIFECYCLE_CHECK", "on").lower()
-            not in ("0", "off", "false", "no"),
+            lifecycle_check=_flag("LIFECYCLE_CHECK", True),
             lifecycle_soon_days=max(0, _int("LIFECYCLE_SOON_DAYS", 365)),
             lifecycle_base_url=os.environ.get("LIFECYCLE_BASE_URL", "https://endoflife.date/api"),
-            slide_diagrams=os.environ.get("SLIDE_DIAGRAMS", "on").lower()
-            not in ("0", "off", "false", "no"),
+            slide_diagrams=_flag("SLIDE_DIAGRAMS", True),
             openrouter_api_key=os.environ.get("OPENROUTER_API_KEY") or None,
             openrouter_model=os.environ.get("OPENROUTER_MODEL", "openai/gpt-4.1-mini"),
             openrouter_fast_model=os.environ.get("OPENROUTER_FAST_MODEL", "openai/gpt-4.1-nano"),

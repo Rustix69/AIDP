@@ -69,18 +69,33 @@ services:
       LEASE_SECONDS: 3600
       # The three knobs the analyse stage actually turns, surfaced here so they
       # can be set for one run without editing .env — which is what an A/B
-      # against samples/ANSWER_KEY.md needs:
+      # against samples/MERIDIAN_ANSWER_KEY.md needs:
       #
       #   JUDGE_READINGS=1 ASSESS_CONCURRENCY=8 docker compose up -d analyse
       #
-      # Empty means the default in config.py (3 readings, 8 at once, whole
-      # document when it fits).
+      # Unset means the default in config.py for the first two (3 readings, 8
+      # at once).
+      #
+      # PREFER_WHOLE_DOCUMENT does NOT fall through to that default, and the
+      # difference is money. Compose interpolates these from `Workers/.env`,
+      # but only when it is run from `Workers/` — run it from anywhere else and
+      # every one of them resolves empty. `${VAR:-}` would then hand the
+      # container an empty string, config.py would read that as "no setting"
+      # and fall back to its own default of *on*, and the run would read the
+      # whole design into every single call: 11,134 input tokens a call across
+      # 382 calls, 84% of a $2.03 run, with nothing anywhere saying it had
+      # happened. See the note above this knob in `.env`.
+      #
+      # So the fallback here states the safe value rather than deferring. It
+      # mirrors `.env` on purpose: the duplication is the point, because the
+      # two are read under different conditions and only one of them survives
+      # being run from the wrong directory.
       # The model the *verdicts* are reached with, which is worth separating
       # from the one that describes figures and reads a standard's rules: the
       # judge is the quality-critical call, and the clause set has to be held
-      # constant to compare two judges against samples/ANSWER_KEY.md at all.
+      # constant to compare two judges against the answer key at all.
       # Defaults to the .env model, so leaving it alone changes nothing.
       OPENROUTER_MODEL: ${JUDGE_MODEL:-openai/gpt-4.1-mini}
       JUDGE_READINGS: ${JUDGE_READINGS:-}
       ASSESS_CONCURRENCY: ${ASSESS_CONCURRENCY:-}
-      PREFER_WHOLE_DOCUMENT: ${PREFER_WHOLE_DOCUMENT:-}
+      PREFER_WHOLE_DOCUMENT: ${PREFER_WHOLE_DOCUMENT:-off}

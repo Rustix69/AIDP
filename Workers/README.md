@@ -99,11 +99,18 @@ documents and write the contextual preamble each chunk carries into its
 embedding. Embeddings are a separate call.
 
 **OpenRouter is the default and covers all of it with one key**:
-`openai/gpt-4.1-mini` for anything a verdict or a rule rests on,
-`openai/gpt-4.1-nano` for the per-chunk preambles, and
+`openai/gpt-4.1-mini` for anything a verdict or a rule rests on, and
 `openai/text-embedding-3-large` at 1024 dims for vectors. Every request sends
 `data_collection: deny` and is pinned to `OPENROUTER_PROVIDERS` (OpenAI and
-Azure by default), so client documents never reach a host that trains on prompts.
+Azure by default, though `.env` here narrows it to OpenAI alone), so client
+documents never reach a host that trains on prompts.
+
+`OPENROUTER_FAST_MODEL` names the model for per-chunk preambles and defaults to
+`openai/gpt-4.1-nano`. **Nothing calls it as configured**: `.env` sets
+`CONTEXTUAL_PREAMBLES=off`, which disables the only caller, and sets the fast
+model to `gpt-4.1-mini` besides. Said here because this paragraph is what
+somebody reads to answer "which models does a run actually bill", and the
+honest answer today is one judge model and one embedding model.
 Gemini (`LLM_PROVIDER=gemini`) and Anthropic (`LLM_PROVIDER=anthropic`, with a
 separate embeddings vendor) remain available.
 
