@@ -1,11 +1,13 @@
 /**
  * Score a run that already exists against an answer key. No model calls.
  *
- * `eval-project-answer-key.mts` builds its own world: a throwaway organisation,
- * five uploads, parse/chunk/embed, then a fresh assessment. That is the right
- * shape for the generated Northwind corpus, whose files live in `samples/`.
+ * There used to be a companion, `eval-project-answer-key.mts`, which built its
+ * own world: a throwaway organisation, five uploads, parse/chunk/embed, then a
+ * fresh assessment. That was the right shape for the generated Northwind
+ * corpus, and both it and that corpus have been deleted — the six client
+ * registers are the only standards this product uses.
  *
- * It is the wrong shape for a real customer corpus. The six client registers
+ * That shape was wrong for a real customer corpus anyway. The six client registers
  * and the design assessed against them were uploaded through the product and
  * live in the database; the PDFs are not in the repository, and re-uploading
  * them would pay for parsing, chunking and embedding a second time to arrive at
@@ -20,7 +22,8 @@
  *   npx tsx --env-file=.env.local scripts/score-run.mts \
  *     cmw6go9ex000ffbuyydaic3xy MERIDIAN_ANSWER_KEY.md
  *
- * `keyFile` is resolved inside `samples/` and defaults to ANSWER_KEY.md.
+ * `keyFile` is resolved inside `samples/` and defaults to MERIDIAN_ANSWER_KEY.md,
+ * which is now the only key there.
  *
  * ## Two accuracy figures, deliberately
  *
@@ -44,7 +47,7 @@ import { prisma } from "../src/lib/prisma";
 const SAMPLES = path.resolve(process.cwd(), "..", "samples");
 const HISTORY = path.resolve(process.cwd(), "scripts", "eval-history.jsonl");
 
-const [runId, keyFile = "ANSWER_KEY.md"] = process.argv.slice(2);
+const [runId, keyFile = "MERIDIAN_ANSWER_KEY.md"] = process.argv.slice(2);
 if (!runId) {
   console.error("usage: score-run.mts <runId> [keyFile]");
   process.exit(2);

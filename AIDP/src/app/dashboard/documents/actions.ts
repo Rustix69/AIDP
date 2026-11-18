@@ -22,7 +22,6 @@ import {
   setClauseStatus,
   unapproveDraft,
 } from "@/lib/ingest/standards";
-import { seedStandardLibrary } from "@/lib/ingest/standards-library";
 import { removeDocument } from "@/lib/ingest/documents";
 import { EditRefused, applyEdit, type FindingPatch } from "@/lib/ingest/finding-edits";
 import { EDIT_FIELD_LABEL } from "@/lib/ingest/verdicts";
@@ -1477,75 +1476,5 @@ export async function reviewFigure(
       return { ok: false, message: "You do not have access to that figure." };
     }
     return { ok: false, message: "Could not record that decision." };
-  }
-}
-
-/**
- * Give this organisation the product's own baseline standards library.
- *
- * The answer to an empty Reference Library. Until this existed a new customer
- * had nothing to be measured against and no way to get anything except an
- * administrator finding and uploading six files, so the first assessment they
- * tried refused to start.
- *
- * Administrator only, and for the reason `guardStandards` gives rather than a
- * weaker one: whoever puts reference documents into a workspace decides what
- * every future assessment in it measures. That this particular set is ours
- * changes nothing about who may introduce it.
- *
- * Safe to press twice. `seedStandardLibrary` goes through `intake.record()`,
- * which is content-addressed per organisation, so a second press resolves to
- * the documents already there instead of ingesting them again — and says so,
- * rather than reporting a success that did nothing.
- */
-export async function seedLibrary(keys?: string[]): Promise<ActionResult> {
-  try {
-    const access = await requireAccess();
-    if (!canManageStandards(access.role)) {
-      return { ok: false, message: STANDARDS_REFUSED };
-    }
-
-    const wanted = Array.isArray(keys)
-      ? keys.filter((key): key is string => typeof key === "string" && key.length > 0)
-      : undefined;
-
-    const { seeded, present, failed, outcomes } = await seedStandardLibrary({
-      organisationId: access.organisation.id,
-      userId: access.user.id,
-      keys: wanted,
-    });
-
-    revalidatePath("/dashboard/documents");
-    revalidatePath("/dashboard");
-
-    // Reported in full rather than as "done". A register that could not be
-    // read is a deployment fault the administrator cannot fix and must not be
-    // left to discover through a clause count that looks low.
-    if (failed) {
-      const names = outcomes
-        .filter((o) => o.state === "failed")
-        .map((o) => o.title)
-        .join(", ");
-      return {
-        ok: seeded > 0,
-        message:
-          `${seeded} standard${seeded === 1 ? "" : "s"} added, but ${failed} could not be read ` +
-          `(${names}). This is a fault on our side — please tell us.`,
-      };
-    }
-
-    if (!seeded) {
-      return { ok: true, message: "Those standards are already in your library." };
-    }
-
-    return {
-      ok: true,
-      message:
-        `${seeded} standard${seeded === 1 ? "" : "s"} added${present ? `, ${present} already there` : ""}. ` +
-        "They are being read now — each one appears in the library as it finishes.",
-    };
-  } catch (error) {
-    if (error instanceof NoAccess) return { ok: false, message: STANDARDS_REFUSED };
-    return { ok: false, message: "Could not add the standards library." };
   }
 }

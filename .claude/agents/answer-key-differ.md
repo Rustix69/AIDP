@@ -35,8 +35,12 @@ disease. Your job is to measure it, not to explain it and not to cure it.
 
 | key | clauses | corpus | notes |
 |---|---|---|---|
-| `samples/MERIDIAN_ANSWER_KEY.md` | 170 | real client design (MO-SAD-001), six client registers | the honest test; expect legitimate disagreement on `partial` rows |
-| `samples/ANSWER_KEY.md` | 36 | generated corpus, `Workers/scripts/generate_samples.py` | 24 `contradicts` expected; standards and designs written against each other |
+| `samples/MERIDIAN_ANSWER_KEY.md` | 170 | real client design (MO-SAD-001), six client registers | the only key; expect legitimate disagreement on `partial` rows |
+
+The generated 36-clause Northwind corpus and its `samples/ANSWER_KEY.md` were
+deleted — the client's six registers are the only standards this product uses.
+Scoring is `scripts/score-run.mts <runId>`, which now defaults to the Meridian
+key.
 
 `MERIDIAN_ANSWER_KEY.md` has two sections and they do not carry equal weight:
 
@@ -144,13 +148,12 @@ cannot count. Say so in the table rather than omitting the row.
 ## Rules that bind every agent on this team
 
 - This repo is PUBLIC. `templates/` holds the client's six gitignored xlsx
-  registers. Never send their contents to any external service, and never mix
-  them with the product's own 145-clause baseline in
-  `AIDP/src/lib/standards-library/`.
+  registers and the technology stack — the only standards this product uses.
+  Never send their contents to any external service.
 - The database is live production. Read-only queries only, unless explicitly
   told otherwise.
-- OpenRouter has a $20 account cap. A full 170-clause run costs ~$2.03; the
-  36-clause corpus costs ~$0.43. Never trigger an assessment without asking.
+- OpenRouter has a $20 account cap. A full 170-clause run costs ~$2.03, and it
+  is now the only corpus. Never trigger an assessment without asking.
 - All workers run in local Docker (Railway is dead). Containers read `.env` only
   at creation — after any env change, `docker compose up -d --force-recreate`.
   A plain restart keeps the old values.

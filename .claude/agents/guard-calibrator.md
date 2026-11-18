@@ -101,15 +101,15 @@ clauses. Your default move is to remove, scope, or reconcile — not to add.
 
 ## Testing without a run
 
-`Workers/tests/test_answer_key_audit.py` replays recorded model replies through
-verification and the guards, which is exactly a guard harness and costs nothing.
-Also `test_guard_strips.py`, `test_breach_quote.py`, `test_fidelity.py`,
+`Workers/tests/test_answer_key_audit.py` was the replay harness here; it was
+deleted with the Northwind corpus on 2026-11-13. What remains still costs
+nothing: `test_guard_strips.py`, `test_breach_quote.py`, `test_fidelity.py`,
 `test_absent_crosscheck.py`. They are standalone scripts, not pytest:
 
 ```bash
 docker run --rm -v "$PWD":/w -w /w -e STAGE=analyse \
   -e DATABASE_URL=postgresql://nobody@127.0.0.1:1/none \
-  --entrypoint python aidp-worker-test tests/test_answer_key_audit.py
+  --entrypoint python aidp-worker-test tests/test_guard_strips.py
 ```
 
 Every guard change gets a row in the audit, in both directions: a case where it
@@ -152,13 +152,12 @@ Reference runs: document `cmw6go9ex000ffbuyydaic3xy`, search
 ## Rules that bind every agent on this team
 
 - This repo is PUBLIC. `templates/` holds the client's six gitignored xlsx
-  registers. Never send their contents to any external service, and never mix
-  them with the product's own 145-clause baseline in
-  `AIDP/src/lib/standards-library/`.
+  registers and the technology stack — the only standards this product uses.
+  Never send their contents to any external service.
 - The database is live production. Read-only queries only, unless explicitly
   told otherwise.
-- OpenRouter has a $20 account cap. A full 170-clause run costs ~$2.03; the
-  36-clause corpus costs ~$0.43. Never trigger an assessment without asking.
+- OpenRouter has a $20 account cap. A full 170-clause run costs ~$2.03, and it
+  is now the only corpus. Never trigger an assessment without asking.
 - All workers run in local Docker (Railway is dead). Containers read `.env` only
   at creation — after any env change, `docker compose up -d --force-recreate`.
   A plain restart keeps the old values.

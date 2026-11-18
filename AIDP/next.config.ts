@@ -1,22 +1,6 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  /**
-   * The baseline standards library ships as six `.xlsx` files that
-   * `seedStandardLibrary` reads off disk at run time. Nothing imports them, so
-   * the build's file tracing cannot see them, and they would be missing from
-   * the deployed function — seeding would fail in production having worked
-   * everywhere locally.
-   *
-   * Top-level rather than under `experimental` in Next 16; the key is a route
-   * glob and the value is resolved from the project root. `"/*"` because
-   * seeding is reachable from a server action on the documents page and from
-   * `scripts/`, and a narrower key would silently stop covering it the first
-   * time either moved.
-   */
-  outputFileTracingIncludes: {
-    "/*": ["src/lib/standards-library/files/**/*"],
-  },
   experimental: {
     serverActions: {
       /**

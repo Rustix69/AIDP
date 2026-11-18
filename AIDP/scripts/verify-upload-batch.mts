@@ -14,6 +14,7 @@
  *
  *   npx tsx --env-file=.env.local scripts/verify-upload-batch.mts
  */
+import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { prisma } from "../src/lib/prisma";
@@ -24,7 +25,32 @@ import { MAX_FILES } from "../src/lib/ingest/intake";
 const BASE = process.env.BASE_URL ?? "http://localhost:3000";
 const PASSWORD = "a-throwaway-password";
 const TAG = `zz-batch-${Date.now()}`;
-const SAMPLES = path.resolve(process.cwd(), "..", "samples", "standards");
+/**
+ * Three real documents to attach. These were the generated Northwind standards
+ * PDFs in `samples/standards/`, which were deleted along with the rest of that
+ * corpus — the client's six registers in `templates/` are now the only
+ * standards in the tree.
+ *
+ * Any three real files do: this guards the *door*, not the parser. What it
+ * needs of them is that they are accepted, stored and queued, and the parse
+ * jobs are deleted a few lines below before a worker can claim them.
+ *
+ * `templates/` is gitignored, so it is absent on a fresh clone. That is a skip,
+ * not a failure — the same call `Workers/tests/test_standards_register.py`
+ * makes about the same directory.
+ */
+const TEMPLATES = path.resolve(process.cwd(), "..", "templates");
+const FIXTURES = [
+  "Data_Standards.xlsx",
+  "Security_Standards.xlsx",
+  "Solution_Architecture_Standards.xlsx",
+];
+
+if (!FIXTURES.every((name) => existsSync(path.join(TEMPLATES, name)))) {
+  console.log(`  .... skipped — ${TEMPLATES} does not hold the three fixture registers`);
+  await prisma.$disconnect();
+  process.exit(0);
+}
 
 let pass = 0;
 let fail = 0;
@@ -91,21 +117,18 @@ async function post(cookie: string, attach: [string, Uint8Array][], role = "refe
 
 try {
   const boss = await person("boss", OWNER);
-  const pdf = async (name: string) =>
-    [name, new Uint8Array(await readFile(path.join(SAMPLES, name)))] as [string, Uint8Array];
+  const fixture = async (name: string) =>
+    [name, new Uint8Array(await readFile(path.join(TEMPLATES, name)))] as [string, Uint8Array];
 
-  const three = [
-    await pdf("Data_Standards.pdf"),
-    await pdf("Security_Standards.pdf"),
-    await pdf("Solution_Architecture_Standards.pdf"),
-  ];
+  const three = await Promise.all(FIXTURES.map(fixture));
 
   console.log("\nThree standards in one request");
   const batch = await post(boss, three);
   // Counted and taken off the queue in one transaction, before anything else:
   // a live parse worker claims these within seconds otherwise and parses the
-  // fixtures for real — paid vision calls on three sample PDFs, and a worker
-  // left holding documents the cleanup removes underneath it.
+  // fixtures for real, leaving it holding documents the cleanup removes
+  // underneath it. A register parses deterministically and so costs nothing,
+  // but that is a property of today's fixtures and not a reason to race.
   const queued = await prisma.$transaction(async (tx) => {
     const n = await tx.job.count({ where: { organisationId: org.id, stage: "parse" } });
     await tx.job.deleteMany({ where: { organisationId: org.id, stage: "parse" } });
@@ -142,7 +165,7 @@ try {
 
   console.log("\nOne bad file does not cost the good ones");
   const mixed = await post(boss, [
-    await pdf("Data_Standards.pdf"),
+    await fixture("Data_Standards.xlsx"),
     ["notes.txt", new TextEncoder().encode("just some text, not a document")],
     ["empty.pdf", new Uint8Array()],
   ]);
@@ -160,7 +183,7 @@ try {
   );
 
   console.log("\nOne file answers as it always did");
-  const single = await post(boss, [await pdf("Data_Standards.pdf")]);
+  const single = await post(boss, [await fixture("Data_Standards.xlsx")]);
   ok("no batch wrapper", single.body.files === undefined, single.body);
   ok("the old shape, recognised as a duplicate", single.body.duplicate === true, single.body);
 

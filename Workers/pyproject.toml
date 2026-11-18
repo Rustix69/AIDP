@@ -41,14 +41,6 @@ target-version = "py311"
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
 
-[tool.ruff.lint.per-file-ignores]
-# The sample corpus is prose. Its clause statements and design paragraphs are
-# quoted text that has to read naturally in the generated PDF; hard-wrapping
-# them to satisfy a line-length rule would make the source worse and the output
-# no different.
-"scripts/samples/standards.py" = ["E501"]
-"scripts/samples/designs.py" = ["E501"]
-
 [tool.mypy]
 python_version = "3.11"
 warn_unused_ignores = true

@@ -113,9 +113,9 @@ the only agent that may say so.
 
 ## Checking without a run
 
-`Workers/tests/test_verdict_schema.py` and `test_answer_key_audit.py` are
-standalone scripts, not pytest, and they exercise everything after the reply
-comes back:
+`Workers/tests/test_verdict_schema.py` is a standalone script, not pytest, and
+it exercises everything after the reply comes back (`test_answer_key_audit.py`
+stood beside it until the Northwind corpus was deleted on 2026-11-13):
 
 ```bash
 docker run --rm -v "$PWD":/w -w /w -e STAGE=analyse \
@@ -156,13 +156,12 @@ Reference runs: document `cmw6go9ex000ffbuyydaic3xy`, search
 ## Rules that bind every agent on this team
 
 - This repo is PUBLIC. `templates/` holds the client's six gitignored xlsx
-  registers. Never send their contents to any external service, and never mix
-  them with the product's own 145-clause baseline in
-  `AIDP/src/lib/standards-library/`.
+  registers and the technology stack — the only standards this product uses.
+  Never send their contents to any external service.
 - The database is live production. Read-only queries only, unless explicitly
   told otherwise.
-- OpenRouter has a $20 account cap. A full 170-clause run costs ~$2.03; the
-  36-clause corpus costs ~$0.43. Never trigger an assessment without asking.
+- OpenRouter has a $20 account cap. A full 170-clause run costs ~$2.03, and it
+  is now the only corpus. Never trigger an assessment without asking.
 - All workers run in local Docker (Railway is dead). Containers read `.env` only
   at creation — after any env change, `docker compose up -d --force-recreate`.
   A plain restart keeps the old values.

@@ -490,22 +490,21 @@ model Document {
   //                the Technology model.
   role String @default("reference")
 
-  /// Which register of the product's own baseline library this copy is —
-  /// "security", "data", "integration" and so on, from REGISTERS in
-  /// lib/standards-library. Null for anything the customer brought themselves,
-  /// which is every document that was uploaded rather than seeded.
+  /// Which register of the product's own baseline library this copy was —
+  /// "security", "data", "integration" and so on. **Vestigial: nothing writes
+  /// it any more.**
   ///
-  /// The copy is otherwise ordinary: seeding goes through the same
-  /// `intake.record()` an upload goes through, so a seeded register parses,
-  /// chunks, embeds, is assessed against, can be edited and can be deleted
-  /// exactly as an uploaded one can. This field only says where it came from,
-  /// so the library can label it and offer it back after a delete.
+  /// The baseline library it named, its seeder and the onboarding panel that
+  /// offered it were all deleted on 2026-11-13; the client's own registers are
+  /// the only standards this product uses, and every document now arrives by
+  /// upload. The column stays rather than being dropped so that rows written
+  /// while it meant something keep saying what they said. Read it defensively
+  /// and do not add a writer without reviving the library it refers to.
   ///
-  /// Deliberately not `isBaseline` on Framework: that models a second *layer*
-  /// assessed alongside the customer's own, and nothing writes it. What was
-  /// chosen here is replacement — a customer with their own Data standards
-  /// removes ours and uploads theirs, and `resolveFramework` picks up the
-  /// change on its own.
+  /// It was deliberately not `isBaseline` on Framework: that models a second
+  /// *layer* assessed alongside the customer's own, and nothing wrote it. What
+  /// was chosen here was replacement — a customer with their own Data
+  /// standards removed ours and uploaded theirs.
   suppliedKey String?
 
   title         String
@@ -588,8 +587,10 @@ model Document {
   // bytes resolves to this row instead of starting the pipeline again.
   @@unique([organisationId, sha256])
   @@index([organisationId, status])
-  /// "Which of our registers is this organisation still running on?" — the one
-  /// question the library screen and the seeder both ask.
+  /// Supported "which of our registers is this organisation still running on?"
+  /// for the library screen and the seeder, both since deleted. Kept with the
+  /// column it indexes — see `suppliedKey` — and dropping it is a migration
+  /// nobody needs today.
   @@index([organisationId, suppliedKey])
   @@map("document")
 }

@@ -90,6 +90,20 @@ except ImportError:  # pragma: no cover
     print("  .... skipped — pymupdf not installed")
     fitz = None
 
+# The three generated Northwind standards this half read were deleted with the
+# rest of that corpus, leaving `templates/` — the client's six registers — as
+# the only standards in the tree. Those are `.xlsx` and go through the register
+# parser, so they cannot stand in for a prose extraction fixture.
+#
+# Skipped rather than removed. The half below is the whole reason this file
+# opens with the extractor: the bug it was written for was a guard that fired
+# only at zero clauses, and "the extractor is not at fault" is the claim that
+# makes the ratio guard the right fix rather than a patch over a bad parse. If
+# a prose corpus comes back, this runs again unchanged.
+if fitz is not None and not any(SAMPLES.glob("*.pdf")):
+    print("  .... skipped — no prose standards fixtures in samples/standards")
+    fitz = None
+
 counts: dict[str, tuple[int, int]] = {}
 if fitz is not None:
     for pdf in sorted(SAMPLES.glob("*.pdf")):

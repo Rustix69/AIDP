@@ -13,7 +13,8 @@
 # their Internal-Use material, not ours to publish.
 /templates/
 /.backup-standards-*/
-# Not to be confused with AIDP/src/lib/standards-library/, which IS tracked:
-# that one is the product's own baseline library, written for this repository
-# and owned by us. These are a customer's. The distinction is the whole reason
-# the baseline had to be written rather than copied.
+# There used to be a second library here to not confuse these with — the
+# product's own 145-standard baseline under AIDP/src/lib/standards-library/,
+# which was tracked. It was deleted on 2026-11-13: the client's six registers
+# and the technology stack are the only standards this product uses. So these
+# are now the only standards anywhere, and the repository ships none.
