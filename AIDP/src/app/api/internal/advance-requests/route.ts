@@ -1,5 +1,5 @@
-import { timingSafeEqual } from "node:crypto";
 import { NextResponse } from "next/server";
+import { authorisedInternally } from "@/lib/access/internal-auth";
 import { advanceSubmitted } from "@/lib/ingest/requests";
 
 /**
@@ -37,44 +37,16 @@ import { advanceSubmitted } from "@/lib/ingest/requests";
  *
  * ## Who may call it
  *
- * Two callers, and each proves itself differently.
- *
- * The embed worker presents `WORKER_SHARED_SECRET`, through the same header it
- * already uses for /api/internal/credentials and /api/internal/files. It holds
- * that secret wherever it runs, so this needs no new configuration anywhere.
- * The same header is what drives this by hand or from a test.
- *
- * Vercel Cron signs its own requests with `CRON_SECRET`, which it sends as a
- * bearer token when a variable of exactly that name is set on the project.
- * Accepted so that adding a `crons` entry to vercel.json is all a timer takes —
- * though Vercel's Hobby plan allows only a daily one, which is why there is no
- * entry there now and why the screens sweep instead.
- *
- * With neither configured the route refuses everything. An endpoint that starts
- * billable model work must never be open, and "no secret set" is a deployment
- * that has not finished rather than a reason to let anyone in.
+ * The embed worker or a timer, proving itself with one of the two secrets in
+ * src/lib/access/internal-auth.ts, which holds the reasoning. Note that
+ * Vercel's Hobby plan allows only a daily cron, which is why there is no
+ * `crons` entry in vercel.json and why the screens sweep for themselves
+ * instead.
  */
 
 export const runtime = "nodejs";
 /** Reads and writes rows on every call; a cached response would be a lie. */
 export const dynamic = "force-dynamic";
-
-function matches(presented: string, expected: string | undefined): boolean {
-  if (!expected) return false;
-  const a = Buffer.from(presented);
-  const b = Buffer.from(expected);
-  // Constant-time, and length-guarded because timingSafeEqual throws on a
-  // mismatch rather than returning false.
-  return a.length === b.length && timingSafeEqual(a, b);
-}
-
-function authorised(request: Request): boolean {
-  const bearer = (request.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "");
-  if (bearer && matches(bearer, process.env.CRON_SECRET)) return true;
-
-  const worker = request.headers.get("x-worker-secret") ?? "";
-  return Boolean(worker) && matches(worker, process.env.WORKER_SHARED_SECRET);
-}
 
 /** The document named in the body, when there is a body naming one.
  *
@@ -93,7 +65,7 @@ async function scope(request: Request): Promise<string | undefined> {
 }
 
 async function handle(request: Request) {
-  if (!authorised(request)) {
+  if (!authorisedInternally(request)) {
     return NextResponse.json({ error: "not authorised" }, { status: 401 });
   }
 
