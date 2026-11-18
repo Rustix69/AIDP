@@ -670,24 +670,26 @@ def handle(job: Job, heartbeat) -> None:
     # the ceiling is the key's rate limit, not this machine.
     workers = max(1, min(get_config().assess_concurrency, len(pending)))
 
-    def judge_task(clause: dict, design_id: str | None) -> None:
-        """One clause, start to committed finding. Runs on a pool thread."""
+    def judge_task(clause: dict, design_id: str | None) -> bool:
+        """One clause, start to committed finding. Runs on a pool thread.
+
+        Returns whether the clause was refused, for the `refused` tally below.
+        """
         unit_scope = designs.only(scope, design_id) if design_id else scope
         unit_context = task_contexts.get(design_id, document_context)
         unit_stack = stack_blocks.get(design_id, stack_block)
         if whole is not None:
-            _assess_document_one(
+            return _assess_document_one(
                 run, clause, whole, unit_scope, unit_context, stack_block=unit_stack
             )
-        else:
-            _assess_one(
-                run,
-                clause,
-                unit_scope,
-                unit_context,
-                design_id=design_id,
-                stack_block=unit_stack,
-            )
+        return _assess_one(
+            run,
+            clause,
+            unit_scope,
+            unit_context,
+            design_id=design_id,
+            stack_block=unit_stack,
+        )
 
     progress.step(step_label, done=completed, total=len(tasks))
     quota: llm.QuotaExhausted | None = None
@@ -714,7 +716,12 @@ def handle(job: Job, heartbeat) -> None:
         for future in futures.as_completed(running):
             clause, design_id = running[future]
             try:
-                future.result()
+                # True where every reading of the clause failed. That path
+                # commits a `needs_review` instead of raising, so without this
+                # it never reached `refused` and the run reported total
+                # coverage — see the `readings=0` note in `_read_and_vote`.
+                if future.result():
+                    refused += 1
             except futures.CancelledError:
                 continue
             except llm.QuotaExhausted as exc:
@@ -1243,6 +1250,21 @@ def _read_and_vote(
             [],
             [],
             best,
+            # Nought readings, not one. The defaults on `_Judged` are
+            # `readings=1, agreed=1`, which here would claim a single reading
+            # that agreed with itself — about a clause where every reading
+            # failed.
+            #
+            # It also has to be counted. `refused` in `handle` increments only
+            # in the pool's `except` arm, and this path does not raise: it
+            # returns a finding, deliberately, so the clause reaches the report
+            # as a question rather than vanishing. The run-level note in
+            # `_complete` ("N of M clauses could not be assessed") therefore
+            # never fired for the one failure it most needs to describe — a
+            # provider degrading across a whole run rather than one clause
+            # tripping. `readings == 0` is what the callers test to count it.
+            readings=0,
+            agreed=0,
         )
     return _vote(taken)
 
@@ -1255,8 +1277,14 @@ def _assess_one(
     *,
     design_id: str | None = None,
     stack_block: str = "",
-) -> None:
-    """Retrieve, judge, guard, commit — one clause, one transaction."""
+) -> bool:
+    """Retrieve, judge, guard, commit — one clause, one transaction.
+
+    Returns whether the clause was refused: every reading of it failed and what
+    was committed is a `needs_review` standing in for an answer. The caller adds
+    that to the run's `refused` tally, which decides whether `_complete` says
+    the assessment was partial. See the `readings=0` note in `_read_and_vote`.
+    """
     query = retrieval.clause_query(
         clause["statement"], clause["requirements"] or [], clause["title"]
     )
@@ -1293,6 +1321,7 @@ def _assess_one(
         dissent=judged.dissent,
         raw=judged.raw,
     )
+    return judged.readings == 0
 
 
 def _precedents(
@@ -1580,7 +1609,7 @@ def _resolve_mode(
     return "document", None, whole
 
 
-def _assess_document_one(
+def _assess_document_one(  # noqa: D401 — see _assess_one for the return
     run: dict,
     clause: dict,
     whole: whole_document.WholeDocument,
@@ -1588,8 +1617,11 @@ def _assess_document_one(
     document_context: str = "",
     *,
     stack_block: str = "",
-) -> None:
+) -> bool:
     """Read the whole document, judge, check every quote, commit — one clause.
+
+    Returns whether the clause was refused, exactly as `_assess_one` does and
+    for the same tally.
 
     Search is not gone from this path; it changes job. It no longer decides what
     the judge sees. It is the second opinion on "absent", the one verdict a
@@ -1723,6 +1755,7 @@ def _assess_document_one(
         dissent=judged.dissent,
         raw=judged.raw,
     )
+    return judged.readings == 0
 
 
 #: A rationale claiming the design does not state something. "absent" is not
@@ -1793,8 +1826,17 @@ def _demote_unconfirmed(run: dict, clauses: list[dict], why: str) -> int:
         with db.connection() as conn:
             rows = db.query(
                 conn,
+                # The replay and vote columns come back too, because this
+                # rewrites the row and `_write` would otherwise put its own
+                # defaults in their place. This pass makes no model call — it is
+                # a guard, and `rawVerdict` is meant to hold what the model said
+                # *before* a guard touched it (see b15ddde). Letting the demoted
+                # verdict land there would make the one column a replay reads
+                # the one column a replay must not trust.
                 'SELECT "clauseId", "designKey", "confidence", "rationale", '
-                '"obligation", "obligationSource" FROM "finding" '
+                '"obligation", "obligationSource", "appliedDecisions", '
+                '"readings", "agreed", "dissent", '
+                '"rawVerdict", "rawConfidence", "rawRationale" FROM "finding" '
                 'WHERE "runId" = %s AND "verdict" = %s AND "confidence" < %s',
                 (run["id"], "absent", CONFIRM_REQUIRED_CONFIDENCE),
             )
@@ -1819,9 +1861,25 @@ def _demote_unconfirmed(run: dict, clauses: list[dict], why: str) -> int:
                 rationale=rationale,
                 evidence=[],
                 retrieval_score=0.0,
-                applied=[],
+                # Carried, not cleared. `appliedDecisions` is why a finding can
+                # still explain itself a year later (see the note on the column
+                # in schema.prisma); a guard that demotes a verdict has not
+                # un-applied the board's decisions, so blanking them here was
+                # losing the record rather than correcting it.
+                applied=list(row.get("appliedDecisions") or []),
                 judged_obligation=_carried_obligation(row),
                 design_id=row.get("designKey") or None,
+                # Likewise the vote. Three readings with one dissent stays three
+                # readings with one dissent; `_write`'s defaults would have
+                # rewritten it as a single unanimous reading.
+                readings=int(row.get("readings") or 1),
+                agreed=int(row.get("agreed") or 1),
+                dissent=row.get("dissent") or None,
+                raw=(
+                    str(row.get("rawVerdict") or ""),
+                    float(row.get("rawConfidence") or 0.0),
+                    str(row.get("rawRationale") or ""),
+                ),
             )
         except Exception as exc:  # noqa: BLE001 — one clause must not sink the rest
             logs.warn(
@@ -1863,7 +1921,7 @@ def _confirm(run: dict, clauses: list[dict], scope: designs.Scope) -> None:
         rows = db.query(
             conn,
             'SELECT "clauseId", "documentId", "verdict", "rationale", '
-            '"obligation", "obligationSource" FROM "finding" '
+            '"obligation", "obligationSource", "appliedDecisions" FROM "finding" '
             'WHERE "runId" = %s AND "verdict" = ANY(%s)',
             (run["id"], ["absent", "partial", "not_assessable"]),
         )
@@ -1883,6 +1941,16 @@ def _confirm(run: dict, clauses: list[dict], scope: designs.Scope) -> None:
     # alternatives run holds one row per candidate design.
     carried = {
         (row["clauseId"], str(row.get("documentId") or "")): _carried_obligation(row)
+        for row in candidates
+    }
+    # And the decisions already applied to each, keyed the same way. A re-read
+    # that overturns "absent" has not un-applied the board's rulings on that
+    # clause, and `_write` would otherwise store the empty list it is handed —
+    # see the note on `appliedDecisions` in schema.prisma.
+    applied_by = {
+        (row["clauseId"], str(row.get("documentId") or "")): list(
+            row.get("appliedDecisions") or []
+        )
         for row in candidates
     }
     if scope.alternatives:
@@ -1917,6 +1985,7 @@ def _confirm(run: dict, clauses: list[dict], scope: designs.Scope) -> None:
                     design,
                     unit_scope,
                     carried=carried,
+                    applied_by=applied_by,
                     design_id=design.document_id,
                 )
         return
@@ -1960,7 +2029,39 @@ def _confirm(run: dict, clauses: list[dict], scope: designs.Scope) -> None:
         for start_at in range(0, len(outstanding), CONFIRM_BATCH):
             batch = outstanding[start_at : start_at + CONFIRM_BATCH]
             raw = llm.confirm_absent(document=whole.text, clauses=_render_absent(batch))
-            answered |= _adopt_confirmations(run, batch, raw, whole, design, scope, carried=carried)
+            answered |= _adopt_confirmations(
+                run,
+                batch,
+                raw,
+                whole,
+                design,
+                scope,
+                carried=carried,
+                applied_by=applied_by,
+                # What `handle` wrote the original finding with, and it has to
+                # match or the rewrite does not land on it. `handle` says
+                # `scope.designs[0].document_id`; inside this loop that is this
+                # iteration's `design`, because the only run that takes the
+                # non-project branch has exactly one.
+                #
+                # Omitted here, this defaulted to None, so `_write` stored
+                # `designKey = ""` while a single-document run's finding carries
+                # `designKey = <documentId>`. The upsert key is
+                # (runId, clauseId, designKey), so the overturned verdict was
+                # INSERTed as a second row and the stale "absent" stayed: the
+                # clause appeared twice on the report and the verdict tallies
+                # came to more than the clause count.
+                #
+                # The `carried` lookup missed for the same reason — it is keyed
+                # on the finding's documentId — so a verdict this pass
+                # overturned also lost the obligation it was carrying and its
+                # severity collapsed to `unstated`.
+                #
+                # A project run was unaffected, because there both sides are "".
+                # That is why this survived: the runs anyone looked at were
+                # project runs.
+                design_id=(design.document_id if not run.get("projectId") else None),
+            )
         changed += len(answered)
         outstanding = [clause for clause in outstanding if clause["id"] not in answered]
 
@@ -2026,7 +2127,7 @@ def _reconsider_covered(run: dict, clauses: list[dict]) -> None:
         rows = db.query(
             conn,
             'SELECT "clauseId", "designKey", "evidence", "rationale", '
-            '"obligation", "obligationSource" FROM "finding" '
+            '"obligation", "obligationSource", "appliedDecisions" FROM "finding" '
             'WHERE "runId" = %s AND "verdict" = %s',
             (run["id"], "covered"),
         )
@@ -2173,7 +2274,16 @@ def _adopt_covered_review(run: dict, batch: list[tuple[dict, dict]], raw: dict) 
             rationale=rationale,
             evidence=row.get("evidence") or [],
             retrieval_score=0.0,
-            applied=[],
+            # Carried, for the reason the column's own note in schema.prisma
+            # gives: a decision the board applied to this clause is still
+            # applied after this pass re-reads the evidence. Only the verdict
+            # moved.
+            #
+            # `raw` and the reading counts are deliberately NOT carried here.
+            # Unlike `_demote_unconfirmed`, this pass made a model call, so the
+            # answer it writes is a model's answer and belongs in `rawVerdict`
+            # — which is what `_write`'s default already does.
+            applied=list(row.get("appliedDecisions") or []),
             judged_obligation=_carried_obligation(row),
             design_id=row.get("designKey") or None,
         )
@@ -2211,6 +2321,7 @@ def _adopt_confirmations(
     scope: designs.Scope,
     *,
     carried: dict[tuple[str, str], str] | None = None,
+    applied_by: dict[tuple[str, str], list] | None = None,
     design_id: str | None = None,
 ) -> set[str]:
     """Rewrite the findings this design's re-read overturned, and only those.
@@ -2283,7 +2394,7 @@ def _adopt_confirmations(
                 }
             ],
             retrieval_score=0.0,
-            applied=[],
+            applied=list((applied_by or {}).get((clause["id"], design_id or ""), [])),
             judged_obligation=(carried or {}).get((clause["id"], design_id or ""), ""),
             design_id=design_id,
         )
@@ -3068,7 +3179,15 @@ def _normalise(
         verdict,
         confidence,
         rationale,
-        [str(c) for c in cited if c],
+        # Deduplicated, order kept. A model that cites the same extract twice is
+        # making one claim, not two, and two places downstream counted it as
+        # two: the evidence array stored the chunk twice, and `_guard`'s
+        # diagram-only check compares `len(cited_generated)` — a set — against
+        # `cited_total`, a count. One repeated figure id made those two numbers
+        # differ, the condition read as "not every citation is a figure", and a
+        # verdict resting on nothing but a diagram description walked past the
+        # one guard that exists to stop it.
+        list(dict.fromkeys(str(c) for c in cited if c)),
         [str(a) for a in applied if a],
     )
 

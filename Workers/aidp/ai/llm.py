@@ -3384,6 +3384,14 @@ class OpenRouterLLM:
                     max_tokens=wider,
                     model=model,
                     temperature=temperature,
+                    # The same trap the `judge` wrapper warns about a few
+                    # hundred lines below, sprung here instead. Dropped, this
+                    # fell back to the default `_SEED` — reading zero's seed —
+                    # so a reading that happened to be cut off at the output
+                    # limit came back as a repeat of the first one, at reading
+                    # n's temperature. The vote then counted two opinions as
+                    # three. Carried, a retried reading is still its own draw.
+                    seed=seed,
                     schema=schema,
                     name=name,
                     attempts=attempts,
@@ -3958,6 +3966,29 @@ def confirm_absent(*, document: str, clauses: str) -> dict:
     word for word.
     """
     return client().confirm_absent(document=document, clauses=clauses)
+
+
+def review_covered(*, clauses: str) -> dict:
+    """Read every "covered" back against the passages that were quoted for it.
+
+    The second opinion on the one verdict that closes a clause. "Covered" is the
+    only answer a reviewer does not go looking behind, so a first reading that
+    satisfied a requirement across most of the estate and quoted the exception
+    in the same breath — "MFA on all privileged access… the legacy operations
+    console uses username and password" — passes into the report as a pass.
+
+    One call for the whole batch, and it never sees the design: only the clause
+    and the extracts the first reading already chose as its proof. It cannot
+    discover new evidence, which is the point — the question is whether the
+    proof carries the verdict, not whether a better proof exists.
+
+    This wrapper was missing while `analyse._reconsider_covered` called it, so
+    every run raised `AttributeError` into the catch-all at `analyse.py:2016`
+    and the pass logged a warning instead of running. See
+    `tests/test_llm_surface.py`, which now holds the module to every name the
+    workers call on it.
+    """
+    return client().review_covered(clauses=clauses)
 
 
 def group_findings(*, findings: str) -> dict:
