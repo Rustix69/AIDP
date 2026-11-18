@@ -1,4 +1,4 @@
-"""The embed stage tells the app, and nothing it says can fail the job.
+"""The workers tell the app what landed, and nothing they say can fail the job.
 
 The pipeline stops at embed: `queue.NEXT_STAGE["embed"]` is None, and deciding
 to assess is not the worker's decision to make — it needs the framework
@@ -231,10 +231,80 @@ ok(
 )
 ok("and which document it was about", fields.get("documentId") == "doc-1")
 ok(
-    "and it says the timer will catch it, so nobody goes looking for a lost job",
-    "timer" in message,
+    # "sweep", not "timer": nothing schedules these endpoints today — vercel.json
+    # has no crons entry, and the screens repair their own state as they render.
+    # A log line promising a timer sends somebody to look for one.
+    "and it says a sweep will catch it, so nobody goes looking for a lost job",
+    "sweep" in message,
     message,
 )
+
+print("\nAn assessment that has landed")
+
+# The gap this closes: the analyse stage writes assessment_run.state and stops.
+# It must not write architecture_request — this process only ever SELECTs that
+# table, and a worker able to move a submission through the workflow would be
+# the engine advancing the governance it is supposed to be judged by. So it
+# says which run landed and carries no verdict about it.
+arrange(response=httpx.Response(200, json={"reported": 1, "failed": 0, "waiting": 0}))
+notify.run_complete("run-9")
+ok(
+    "it goes to the runs endpoint, not the documents one",
+    _Client.sent.get("url") == "https://app.example/api/internal/advance-runs",
+    _Client.sent.get("url"),
+)
+ok("it names the run", _Client.sent.get("json") == {"runId": "run-9"})
+ok(
+    "it presents the same shared secret",
+    (_Client.sent.get("headers") or {}).get("x-worker-secret") == "s3cret",
+)
+ok(
+    "and says nothing about how the run ended",
+    "state" not in (_Client.sent.get("json") or {})
+    and "failed" not in (_Client.sent.get("json") or {}),
+    _Client.sent.get("json"),
+)
+
+# Both endings go through one call. _fail reaches it too, and the app reads the
+# run's own state to tell them apart.
+arrange(response=httpx.Response(200, json={"reported": 0, "failed": 1, "waiting": 0}))
+notify.run_complete("run-dead")
+ok("a failed run is reported the same way", _Client.sent.get("json") == {"runId": "run-dead"})
+
+stub = _Refuse()
+stub.cfg = config()
+install(stub)
+notify.run_complete(None)
+ok("no run id attempts nothing", True)
+notify.run_complete("")
+ok("nor does an empty one", True)
+
+stub = _Refuse()
+stub.cfg = config(app_base_url="")
+install(stub)
+notify.run_complete("run-9")
+ok("and with no app to tell, nothing is attempted", True)
+
+stub = _Refuse()
+stub.cfg = config(worker_shared_secret="")
+install(stub)
+notify.run_complete("run-9")
+ok("nor with no secret to prove itself with", True)
+
+print("\nAnd a failure there cannot fail the assessment either")
+
+for name, kwargs in [
+    ("the app is unreachable", {"raises": httpx.ConnectError("refused")}),
+    ("the app is too slow", {"raises": httpx.ReadTimeout("slow")}),
+    ("the app answers 500", {"response": httpx.Response(500, text="nope")}),
+    ("the reply is not readable", {"response": httpx.Response(200, text="not json")}),
+]:
+    arrange(**kwargs)
+    try:
+        notify.run_complete("run-9")
+        ok(name, True)
+    except Exception as exc:  # noqa: BLE001
+        ok(name, False, exc)
 
 notify.get_config = _real_config
 notify.httpx.Client = _real_client

@@ -39,6 +39,7 @@ from .. import (
     fidelity,
     lifecycle,
     logs,
+    notify,
     obligations,
     progress,
     queue,
@@ -3619,6 +3620,11 @@ def _fail(run_id: str, reason: str) -> None:
             (reason[:1000], run_id),
         )
 
+    # A failed run ends a request as surely as a complete one does, and the
+    # requestor is owed the news either way. The app reads the run's own state
+    # to decide which ending it was.
+    notify.run_complete(run_id)
+
 
 def _complete(job: Job, run_id: str, refused: int = 0) -> None:
     """Close the run, and say so honestly when part of it could not be judged.
@@ -3686,6 +3692,16 @@ def _complete(job: Job, run_id: str, refused: int = 0) -> None:
         refused=refused,
         **{c["verdict"]: c["n"] for c in counts},
     )
+
+    # Outside the transaction and after it has committed, the same ordering
+    # embed.py uses for document_ready: the run is complete whether or not
+    # anyone is told, and a call made inside would hold the transaction open
+    # for the length of an HTTP round trip.
+    #
+    # This is what lets "your report is ready" be sent at the moment it becomes
+    # true, instead of whenever somebody next opens a page. It never raises —
+    # see notify.py.
+    notify.run_complete(run_id)
 
 
 def mark_failed(run_id: str, reason: str) -> None:
