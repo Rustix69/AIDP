@@ -95,7 +95,7 @@ model User {
   publishedClauseDrafts ClauseDraft[] @relation("ClauseDraftPublisher")
 
   // Every technology status they changed. Append-only — see TechnologyChange.
-  technologyChanges TechnologyChange[]
+  technologyChanges   TechnologyChange[]
   clauseStatusChanges ClauseStatusChange[]
 
   @@map("user")
@@ -196,6 +196,7 @@ model Organisation {
   aiCache              AiCache[]
   requests             ArchitectureRequest[]
   intakeReadings       IntakeReading[]
+  notifications        Notification[]
   /// This customer's own significance criteria. Seeded from the default nine
   /// and editable thereafter — see SignificanceCriterion.
   significanceCriteria SignificanceCriterion[]
@@ -1065,7 +1066,7 @@ model ClauseStatusChange {
   id String @id @default(cuid())
 
   /// Not a foreign key — see the note above.
-  clauseId String
+  clauseId  String
   /// Denormalised so the record still reads once the clause is gone.
   clauseRef String @default("")
 
@@ -2593,4 +2594,123 @@ model IntakeReading {
 
   @@index([organisationId, state])
   @@map("intake_reading")
+}
+
+// ---------------------------------------------------------------------------
+// Notifications
+//
+// The outbox. Everything the platform has to tell somebody about — a
+// submission received, a report ready, a decision recorded — is a row here
+// before it is a message anywhere.
+//
+// Written in the same breath as the thing it is about, so a state change and
+// the news of it either both happen or neither does, and drained separately by
+// src/lib/notifications/drain.ts. Nothing sends mail inline: a provider that is
+// slow makes a person wait, a provider that is down loses the message with no
+// record that it was ever owed, and neither failure is visible afterwards.
+//
+// This table is also the audit record the brief asks for. Resend keeps its own
+// logs for days and the retention requirement is measured in years, so what was
+// sent, to whom, and what the provider said about it has to live here.
+// ---------------------------------------------------------------------------
+
+/// One message owed to one recipient.
+///
+/// The row is created queued and ends `sent`, `skipped` or `dead`. It is never
+/// deleted on success — a sent notification is evidence that somebody was told,
+/// which is exactly the question an audit asks.
+model Notification {
+  id String @id @default(cuid())
+
+  organisationId String
+  organisation   Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+
+  /// The request this is about, when it is about one. Null for the messages
+  /// that belong to an account rather than a submission.
+  ///
+  /// Relation-free, for the reason ArchitectureRequest.documentId is: this row
+  /// records that a person was told something, and that stays true after the
+  /// thing they were told about has been removed. A cascade here would delete
+  /// the evidence along with the subject.
+  requestId String?
+
+  /// What kind of message this is. The catalogue is
+  /// src/lib/notifications/kinds.ts, which owns the rendering for each one.
+  ///
+  /// A string rather than an enum so the vocabulary can grow without a
+  /// migration, the same choice SubmissionOutcome.decision made. A row whose
+  /// kind is no longer recognised dead-letters rather than being guessed at.
+  kind String
+
+  /// What makes this message the only one of its kind.
+  ///
+  /// `requestId:kind:channel:recipient`. The unique index on it is the whole
+  /// defence against duplicates, and it is not a theoretical one: the screens
+  /// sweep their own state on every render (see advanceSubmitted in
+  /// src/lib/ingest/requests.ts), so the question "has this request moved on?"
+  /// is asked constantly and every answer re-runs the code that enqueues. The
+  /// insert is ON CONFLICT DO NOTHING against this column, which is what turns
+  /// a hundred enqueues into one email.
+  ///
+  /// Channel is in the key because the same news on two channels is two
+  /// messages, and leaving it out would mean a portal notification silently
+  /// suppressing the email that should have gone with it.
+  dedupeKey String @unique
+
+  /// "email" | "portal"
+  channel String @default("email")
+
+  /// Snapshotted at enqueue, not resolved at send.
+  ///
+  /// The address is what it was when the news happened. Looking it up at send
+  /// time would mean a message addressed by a lookup that can now return
+  /// nothing — recipients are `onDelete: SetNull` throughout this schema — and
+  /// an audit record that cannot say where it actually went.
+  toEmail  String?
+  toUserId String?
+  toName   String  @default("")
+
+  /// Everything the template needs, captured when the news happened.
+  ///
+  /// A snapshot rather than foreign keys, the same reasoning
+  /// SubmissionOutcome.snapshot applies: a message has to render a year later
+  /// the way it would have rendered on the day, even though the request has
+  /// moved several states since.
+  payload Json @default("{}")
+
+  /// "queued" | "leased" | "sent" | "skipped" | "dead"
+  ///
+  /// `skipped` is a first-class outcome and not a failure: a recipient with no
+  /// address is a message that was correctly not sent, and recording it as an
+  /// error would bury the real ones.
+  state String @default("queued")
+
+  attempts    Int @default(0)
+  maxAttempts Int @default(5)
+
+  /// Backoff target. A retry is invisible to drainers until now() passes this.
+  runAfter   DateTime  @default(now())
+  leaseUntil DateTime?
+  leaseOwner String?
+
+  /// The provider's own id for the message — Resend's, today. The handle that
+  /// makes a delivery question answerable months later.
+  providerId String?
+  lastError  String?
+
+  /// Follows the message, and matches the correlation id of the work that
+  /// caused it where there is one. Same requirement as Job.correlationId.
+  correlationId String
+
+  sentAt    DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  /// The claim path: drainers only ever look at queued rows that are due.
+  @@index([state, runAfter])
+  /// Everything sent about one submission, newest first.
+  @@index([requestId, createdAt])
+  /// The operator's view of one customer's mail.
+  @@index([organisationId, createdAt])
+  @@map("notification")
 }

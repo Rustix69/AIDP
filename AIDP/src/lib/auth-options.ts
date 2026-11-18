@@ -1,6 +1,8 @@
 import { prismaAdapter } from "better-auth/adapters/prisma";
 import type { BetterAuthOptions } from "better-auth";
 import { prisma } from "./prisma";
+import { mailer } from "./notifications/mailer";
+import { passwordResetMail } from "./notifications/templates/password-reset";
 
 /**
  * How long a sign-in lasts, in seconds: an hour. SESSION_SECONDS overrides it,
@@ -8,6 +10,16 @@ import { prisma } from "./prisma";
  */
 export const SESSION_SECONDS =
   Number(process.env.SESSION_SECONDS) > 0 ? Number(process.env.SESSION_SECONDS) : 60 * 60;
+
+/**
+ * How long a password-reset link stays usable, in seconds: an hour.
+ *
+ * Better Auth's own default is the same hour, but it is named here because the
+ * message says the window out loud. Declared once and passed both to the
+ * option and to the template, so the mail cannot promise a window the token
+ * does not honour.
+ */
+export const RESET_TOKEN_SECONDS = 60 * 60;
 
 /**
  * Better Auth configuration, minus anything Next-specific.
@@ -72,32 +84,39 @@ export const authOptions = {
     enabled: true,
     minPasswordLength: 8,
     autoSignIn: true,
+    resetPasswordTokenExpiresIn: RESET_TOKEN_SECONDS,
 
     /**
      * Password-reset delivery.
      *
-     * No email provider is wired up yet, so in development the reset link is
-     * logged to the server console — copy it out of the terminal to complete
-     * the flow. Replace the body of this function with a real send, e.g. Resend:
+     * The message is composed in src/lib/notifications/templates and handed to
+     * whichever mailer the environment has. With RESEND_API_KEY and MAIL_FROM
+     * set that is Resend; without them it is the console in development, where
+     * the link is copied out of the terminal running `npm run dev`, and an
+     * error in production.
      *
-     *   import { Resend } from "resend";
-     *   const resend = new Resend(process.env.RESEND_API_KEY);
-     *   await resend.emails.send({
-     *     from: "AIDP <no-reply@yourdomain.com>",
-     *     to: user.email,
-     *     subject: "Reset your AIDP password",
-     *     html: `<a href="${url}">Choose a new password</a>`,
-     *   });
+     * ## Why a failure here is allowed to reach the caller
+     *
+     * Throwing turns a provider outage into a 500 on the forgot-password route,
+     * which is deliberate and is what this function did before a provider
+     * existed. The alternative — swallowing the error — tells somebody to check
+     * an inbox that will never receive anything, and leaves no trace that
+     * anything went wrong.
+     *
+     * It does cost a little: during an outage the route answers differently for
+     * an address that has an account and one that does not, which is an
+     * enumeration signal. That trade is accepted because it is available only
+     * while mail is broken for everybody, and a reset nobody receives is the
+     * worse failure of the two.
      */
     sendResetPassword: async ({ user, url }) => {
-      if (process.env.NODE_ENV === "production") {
-        throw new Error(
-          "No email provider configured — wire up sendResetPassword in src/lib/auth-options.ts before shipping.",
-        );
-      }
-      console.info(
-        `\n[AIDP] Password reset requested for ${user.email}\n[AIDP] Reset link: ${url}\n`,
-      );
+      const composed = passwordResetMail({
+        name: user.name ?? "",
+        url,
+        expiresInSeconds: RESET_TOKEN_SECONDS,
+      });
+
+      await mailer().send({ to: user.email, ...composed });
     },
   },
 } satisfies BetterAuthOptions;

@@ -1,6 +1,7 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
+import { after } from "next/server";
 import { NoAccess, requireAccess } from "@/lib/access/gate";
 import {
   RequestRefused,
@@ -12,6 +13,7 @@ import {
   type UpdateInput,
 } from "@/lib/ingest/requests";
 import { advanceSubmitted } from "@/lib/ingest/requests";
+import { drain } from "@/lib/notifications/drain";
 import {
   ReadingRefused,
   acceptProposals,
@@ -90,6 +92,21 @@ export async function submit(id: string): Promise<RequestResult> {
   return run(async (access) => {
     const { reference } = await submitRequest(access, id);
     await advanceSubmitted({ organisationId: access.organisation.id });
+
+    // The outbox, emptied after the response rather than inside it. Submitting
+    // must not wait on a mail provider, and the person has already been told
+    // their request is in. A pass takes everything that is due, not only what
+    // this submission wrote, so it also carries off anything an earlier
+    // attempt left behind — see /api/internal/send-notifications.
+    after(async () => {
+      try {
+        await drain();
+      } catch {
+        // A message that did not leave is still in the outbox, and the next
+        // pass will find it. Nothing here is worth failing a submission over.
+      }
+    });
+
     revalidatePath(`/dashboard/requests/${id}`);
     return {
       ok: true,

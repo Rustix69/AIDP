@@ -164,11 +164,101 @@ client send them and Better Auth accept them, and as columns on `User` in
 `npm run db:migrate`. On the client, `inferAdditionalFields` gives
 `signUp.email` and `useSession` the matching types.
 
-**Password reset.** No email provider is wired up. In development the reset link
-is printed to the terminal running `npm run dev` — copy it out to complete the
-flow. `sendResetPassword` in `src/lib/auth-options.ts` is where a real sender
-(Resend or similar) plugs in; it throws in production rather than silently
-failing.
+**Password reset.** Sent through the mailer in
+`src/lib/notifications/mailer.ts`. Set `RESEND_API_KEY` and `MAIL_FROM` together
+and it goes out through Resend; leave either unset and the message is printed to
+the terminal running `npm run dev` — copy the link out of it to complete the
+flow, exactly as before a provider existed. In production an unset pair throws
+on the action that needs it rather than failing silently.
+
+The reset window is `RESET_TOKEN_SECONDS` in `src/lib/auth-options.ts`, declared
+once and passed both to Better Auth and to the template, so the message cannot
+promise a window the token does not honour.
+
+**Mail.** `resend` is imported in `src/lib/notifications/mailer.ts` and nowhere
+else. Everything sends through the `Mailer` interface, so a customer who
+requires their own Microsoft 365 tenant or SMTP relay is a second implementation
+in that file rather than a change spread across the app. Note that
+`resend.emails.send` resolves with `{ data: null, error }` instead of throwing —
+`ResendMailer` converts that into a thrown `MailRefused`, which is why callers
+can treat a resolved send as a sent message. `npx tsx --env-file=.env.local
+scripts/verify-mailer.mts` checks the whole path without sending anything.
+
+## Notifications
+
+Everything the platform tells somebody about is a row in `notification` before
+it is a message anywhere. `src/lib/notifications/` holds the whole of it:
+`events.ts` is the list of things worth announcing and who each one reaches,
+`enqueue.ts` writes the rows, `kinds.ts` is the catalogue of message types and
+how each is written, and `drain.ts` sends them.
+
+**Nothing sends inline.** A slow provider would make a person wait and a dead
+one would lose the message with no record it was ever owed. The row is written
+in the same breath as the thing it is about; delivery is somebody else's
+problem a moment later.
+
+**Duplicates are the real hazard, not lost mail.** `advanceSubmitted` and
+`advanceChecking` are called on every page render, by design — so the code that
+notices a request has moved on runs constantly, and anything hung off it runs
+constantly too. The unique index on `dedupeKey`
+(`requestId:kind:channel:recipient`) plus `skipDuplicates` is what turns a
+hundred enqueues into one email. Callers may enqueue as often as they like and
+are expected to.
+
+**What drains it**, in the order it usually happens: the server action that
+enqueued drains in `after()`, so the common case leaves within a second; any
+pass takes everything due rather than only what the caller wrote, so stragglers
+go out on the next one; and `/api/internal/send-notifications` is there for a
+timer. No `crons` entry is wired — Vercel's Hobby plan allows one a day, and an
+entry a plan refuses fails the deployment rather than the feature.
+
+**Failures are sorted into two kinds.** A message that cannot be *sent* is
+retried with `min(3600, 2^attempts)` seconds of backoff and dead-letters at
+`maxAttempts`, the same shape `Workers/aidp/queue.py` uses. A message that
+cannot be *written* — unknown kind, payload missing a field — is dead on the
+first pass, because waiting will not supply the field. An unconfigured provider
+is neither: rows stay queued with no attempt spent.
+
+**What is sent, and to whom.** Five kinds, listed in `kinds.ts`:
+
+| Kind | To | On |
+|---|---|---|
+| `submission_received` | requestor | submit |
+| `ready_to_assess` | requestor | `submitted → ready` |
+| `report_ready` | requestor | `checking → reported` |
+| `review_requested` | everyone who can decide | the same transition |
+| `assessment_failed` | requestor | `stop()`, which every failure path goes through |
+
+`ready_to_assess` and `assessment_failed` are in neither client document. The
+first covers a state the documents do not model — a request waits for somebody
+to press "Start assessing", because opening a run costs model calls and that is
+a person's decision. The second exists because failure is not modelled at all,
+and a requestor whose submission stopped was never told.
+
+Recipients are the requestor and, for a report, everyone whose role passes
+`canDecideSubmissions` minus whoever filed it. The brief names an *assigned*
+architect; `ReviewAssignment` is migrated and no code writes it, so asking
+everyone who could decide is the stand-in until it does. There is no board model
+and no watcher list, so ARB and stakeholder messages wait on those.
+
+**How the app learns a run has landed.** It did not, until now: the analyse
+worker wrote `assessment_run.state` and the app found out when somebody opened a
+page. That is fine for a stepper and useless for "your report is ready", which
+has to be sent when nobody is looking. `notify.run_complete` in
+`Workers/aidp/notify.py` now posts the run id to
+`/api/internal/advance-runs`, and the app reads the run row and decides what it
+means — the worker still never writes a governance table. Both endings go
+through it; the run's own state says which.
+
+**Recurring events need a salt.** A failed request is editable: it goes back
+through submit, becomes ready again, and produces a second report. Keyed on the
+request alone the requestor would hear about the first of each and never the
+rest, so callers whose event can recur pass `dedupeSalt` — the run id, usually.
+`submission_received` passes none, because it happens once.
+
+`npx tsx --env-file=.env.local scripts/verify-notifications.mts` checks all of
+it against the database, scoped to a throwaway organisation so a test drain can
+never touch a real customer's outbox.
 
 **Secrets.** `BETTER_AUTH_SECRET` is generated into `.env.local` on first run for
 convenience. Set it through the real environment before deploying — rotating it

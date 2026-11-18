@@ -5,6 +5,12 @@ import { renderRequest, type RenderableRequest } from "@/lib/ingest/render-reque
 import { ProjectRefused, assessableDesigns, startProjectRun } from "@/lib/ingest/projects";
 import { canManageStandards } from "@/lib/access/roles";
 import { runCriteriaCheck } from "@/lib/significance/record";
+import {
+  notifyAssessmentFailed,
+  notifyReadyToAssess,
+  notifyReportReady,
+  notifySubmissionReceived,
+} from "@/lib/notifications/events";
 
 /**
  * Architecture requests — the intake form, and the bridge from it to the engine.
@@ -847,8 +853,10 @@ export async function submitRequest(
   );
   if (adopted) {
     const linked = await link(request.id, adopted, request.reference);
-    // An adopted document is still a submission, and still has to be classified.
+    // An adopted document is still a submission, and still has to be classified
+    // — and the requestor still has to be told it arrived.
     await checkCriteria(request.id);
+    await notifySubmissionReceived(request.id);
     return linked;
   }
 
@@ -887,6 +895,9 @@ export async function submitRequest(
   }
 
   await checkCriteria(request.id);
+  // Both of these are side errands and neither may throw: the submission is
+  // already in and already being read. See notifySubmissionReceived.
+  await notifySubmissionReceived(request.id);
   return { documentId: document.id, reference: request.reference };
 }
 
@@ -1101,7 +1112,13 @@ export async function advanceSubmitted(
         where: { id: request.id, state: SUBMITTED },
         data: { state: READY, failureReason: null },
       });
-      if (moved.count > 0) ready += 1;
+      if (moved.count > 0) {
+        ready += 1;
+        // Only the caller that actually moved the row announces it. The other
+        // two arrive to `count === 0` and say nothing, which is what keeps one
+        // transition to one message even before the dedupe key is consulted.
+        await notifyReadyToAssess(request.id);
+      }
     } catch {
       // A dropped connection, a provider blip. Left in "submitted" to be tried
       // again, because a transient fault should not close a submission.
@@ -1141,7 +1158,14 @@ export async function advanceSubmitted(
  * write nothing rather than drag a decided request back to "reported".
  */
 export async function advanceChecking(
-  options: { limit?: number; organisationId?: string; requestId?: string } = {},
+  options: {
+    limit?: number;
+    organisationId?: string;
+    requestId?: string;
+    /** The run that just landed, which is what the analyse worker knows and
+     *  the request does not tell it. See /api/internal/advance-runs. */
+    runId?: string;
+  } = {},
 ): Promise<{
   /** Moved to "reported" — the run finished and the report is final. */
   reported: number;
@@ -1150,11 +1174,14 @@ export async function advanceChecking(
   /** Still running. The ordinary answer while an assessment is in flight. */
   waiting: number;
 }> {
-  const { limit = 25, organisationId, requestId } = options;
+  const { limit = 25, organisationId, requestId, runId } = options;
   const pending = await prisma.architectureRequest.findMany({
     where: {
       state: CHECKING,
-      runId: { not: null },
+      // Narrowed to the one run when a worker names it, and left open when a
+      // screen or a timer sweeps. `{ not: null }` still applies either way: a
+      // request in "checking" with no run is not something this can resolve.
+      runId: runId ? runId : { not: null },
       ...(requestId ? { id: requestId } : {}),
       ...(organisationId ? { organisationId } : {}),
     },
@@ -1204,7 +1231,13 @@ export async function advanceChecking(
         where: { id: request.id, state: CHECKING },
         data: { state: REPORTED, failureReason: null },
       });
-      if (moved.count > 0) reported += 1;
+      if (moved.count > 0) {
+        reported += 1;
+        // The message the platform exists to send, and the one the engine
+        // could not send for itself: nothing else knows the moment a run
+        // lands. See notifyReportReady.
+        await notifyReportReady(request.id);
+      }
     } catch {
       // A dropped connection. Left in "checking" to be swept again on the next
       // render — the findings are already written, so nothing is lost by
@@ -1362,8 +1395,13 @@ export async function startAssessment(
 }
 
 async function stop(id: string, reason: string): Promise<void> {
+  const recorded = reason.slice(0, 1000);
   await prisma.architectureRequest.update({
     where: { id },
-    data: { state: FAILED, failureReason: reason.slice(0, 1000) },
+    data: { state: FAILED, failureReason: recorded },
   });
+  // Every failure path in this file goes through here, so one hook covers all
+  // four. Neither document asks for this message; a requestor whose submission
+  // stopped and was never told is the reason it is sent anyway.
+  await notifyAssessmentFailed(id, recorded);
 }
