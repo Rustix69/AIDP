@@ -1,0 +1,158 @@
+{
+  "at": "2026-11-22T09:53:28Z",
+  "repeats": 2,
+  "clauses": 36,
+  "model": "openai/gpt-4.1-mini",
+  "accuracy_mean": 44.4,
+  "accuracy_sd": 2.78,
+  "must_mean": 62.5,
+  "settled": 26,
+  "settled_right": 12,
+  "seconds": 854,
+  "verdicts": {
+    "EA-010": [
+      "covered",
+      "covered"
+    ],
+    "DAT-005": [
+      "partial",
+      "contradicts"
+    ],
+    "SEC-022": [
+      "partial",
+      "partial"
+    ],
+    "SEC-005": [
+      "partial",
+      "partial"
+    ],
+    "SEC-012": [
+      "partial",
+      "partial"
+    ],
+    "INT-037": [
+      "partial",
+      "partial"
+    ],
+    "INF-011": [
+      "covered",
+      "covered"
+    ],
+    "EA-008": [
+      "needs_review",
+      "covered"
+    ],
+    "DAT-019": [
+      "contradicts",
+      "contradicts"
+    ],
+    "SEC-028": [
+      "partial",
+      "partial"
+    ],
+    "INT-005": [
+      "contradicts",
+      "partial"
+    ],
+    "INT-002": [
+      "covered",
+      "needs_review"
+    ],
+    "SOL-012": [
+      "contradicts",
+      "covered"
+    ],
+    "INF-013": [
+      "contradicts",
+      "contradicts"
+    ],
+    "DAT-001": [
+      "partial",
+      "partial"
+    ],
+    "SEC-014": [
+      "contradicts",
+      "contradicts"
+    ],
+    "SOL-032": [
+      "covered",
+      "covered"
+    ],
+    "DAT-020": [
+      "contradicts",
+      "contradicts"
+    ],
+    "INT-014": [
+      "needs_review",
+      "covered"
+    ],
+    "SOL-017": [
+      "covered",
+      "covered"
+    ],
+    "EA-007": [
+      "contradicts",
+      "needs_review"
+    ],
+    "SEC-008": [
+      "partial",
+      "contradicts"
+    ],
+    "INT-040": [
+      "partial",
+      "partial"
+    ],
+    "DAT-023": [
+      "partial",
+      "partial"
+    ],
+    "EA-009": [
+      "partial",
+      "partial"
+    ],
+    "INF-018": [
+      "contradicts",
+      "contradicts"
+    ],
+    "INT-032": [
+      "contradicts",
+      "contradicts"
+    ],
+    "SEC-006": [
+      "contradicts",
+      "contradicts"
+    ],
+    "SEC-019": [
+      "partial",
+      "contradicts"
+    ],
+    "SOL-002": [
+      "partial",
+      "partial"
+    ],
+    "EA-015": [
+      "contradicts",
+      "contradicts"
+    ],
+    "SOL-016": [
+      "partial",
+      "partial"
+    ],
+    "DAT-028": [
+      "partial",
+      "partial"
+    ],
+    "SEC-024": [
+      "partial",
+      "partial"
+    ],
+    "INT-038": [
+      "contradicts",
+      "partial"
+    ],
+    "DAT-015": [
+      "contradicts",
+      "contradicts"
+    ]
+  }
+}
