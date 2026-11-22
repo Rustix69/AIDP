@@ -122,6 +122,24 @@ class WholeDocument:
     #: them: a quote is the document's own words only if it is in `_normal`.
     #: page -> [(figure id, normalised description)].
     _figures: dict[int | None, list[tuple[str | None, str]]] = field(default_factory=dict)
+    #: The page's table lines with the parse's repeated column labels taken off,
+    #: which is the table as a reader sees it. page -> normalised text.
+    #:
+    #: A separate index rather than more of `_normal`, for the reason `_figures`
+    #: is separate: appending a second rendering of the same words to a page
+    #: would let a quote match by spanning the join between the two copies and
+    #: claim a passage the document does not contain.
+    #:
+    #: It exists because the parse binds every cell to its column —
+    #: "Source -> Target: Web/mobile -> API Gateway | Pattern / mechanism:
+    #: Request-Response" — and a model quoting the grid writes the header once
+    #: and then the bare values. Measured on MERIDIAN ONE: of 95 table rows,
+    #: 95 verify when quoted as stored and 0 when quoted as the grid. Fifteen of
+    #: the twenty-two refused quotes in the findings table are table quotes, and
+    #: a refused quote costs the whole finding — `_guard_document` demotes a
+    #: verdict with no evidence left, which is how a correct "covered" on
+    #: INT-002 became "needs_review".
+    _tables: dict[int | None, str] = field(default_factory=dict)
 
     @property
     def tokens(self) -> int:
@@ -160,6 +178,14 @@ class WholeDocument:
                 )
                 return Check(True, found, reason)
 
+        # Still the document's own words, only without the column labels the
+        # parse repeats into every cell. A hit is `source_kind="page"` and
+        # carries no caveat: nothing was invented and nothing generated, the
+        # reader's rendering of a table simply differs from the stored one.
+        table = self._locate_table(parts, page)
+        if table is not None:
+            return Check(True, table, "")
+
         # Not in the document's own words. A design often states a capability
         # only inside an architecture diagram — an API gateway that appears in
         # no paragraph — and refusing that quote reported the clause absent when
@@ -194,6 +220,18 @@ class WholeDocument:
             for figure_id, description in self._figures[candidate]:
                 if _in_order(description, parts):
                     return candidate, figure_id
+        return None
+
+    def _locate_table(self, parts: list[str], page: int | None) -> int | None:
+        """The page whose tables hold the quote, read as a grid rather than as
+        the parse stored it. The named page first, as everywhere else."""
+        pages = list(self._tables)
+        if page in self._tables:
+            pages.remove(page)
+            pages.insert(0, page)
+        for candidate in pages:
+            if _in_order(self._tables[candidate], parts):
+                return candidate
         return None
 
     def _locate(self, index: int, parts: list[str]) -> int | None:
@@ -250,6 +288,35 @@ def _in_order(haystack: str, parts: list[str]) -> bool:
     return True
 
 
+#: The longest a cell's column label may be before the leading "Label: " is
+#: taken for ordinary prose that happens to contain a colon. Column headings in
+#: these documents run to "Latency, frequency, volume" and "Failure handling /
+#: notes"; a sentence introducing a list is longer than this and keeps its colon.
+_MAX_LABEL_WORDS = 8
+
+
+def _ungrid(line: str) -> str:
+    """One table row as a reader sees it: the column labels taken off.
+
+    The parse binds every cell to its column so that a row lifted out of its
+    table still says which value answers what — see `rules._row_text`. That is
+    right for the judge, which is shown the stored line, and wrong for the
+    judge's *quote*, which it copies in the shape the table is printed in.
+
+    Only a leading "Label: " on a pipe-separated cell is removed, and only when
+    the label is short enough to be a column heading. Nothing else is touched,
+    so the result is always a subsequence of the row's own words.
+    """
+    cells = []
+    for cell in line.split(" | "):
+        label, separator, value = cell.partition(": ")
+        if separator and value and len(label.split()) <= _MAX_LABEL_WORDS:
+            cells.append(value)
+        else:
+            cells.append(cell)
+    return " | ".join(cells)
+
+
 def build(title: str, lines: list[dict], figures: list[dict]) -> WholeDocument:
     """The document as the judge reads it, from `source_line` and `figure` rows.
 
@@ -259,6 +326,7 @@ def build(title: str, lines: list[dict], figures: list[dict]) -> WholeDocument:
     left out, and a reviewer's correction replaces the model's reading.
     """
     document = WholeDocument(title=title)
+    ungridded: dict[int | None, list[str]] = {}
     for row in lines:
         text = " ".join(str(row.get("text") or "").split())
         if not text:
@@ -269,6 +337,13 @@ def build(title: str, lines: list[dict], figures: list[dict]) -> WholeDocument:
         kind = row.get("kind")
         prefix = "## " if kind == "heading" else "- " if kind == "bullet" else ""
         document.pages[-1][1].append(prefix + text)
+        if kind in ("table_row", "table_header"):
+            # The header carries no labels to strip and is kept as it is, so a
+            # quote of a header followed by its rows — which is how a grid is
+            # copied out — matches as one passage.
+            ungridded.setdefault(page, []).append(
+                _ungrid(text) if kind == "table_row" else text
+            )
 
     for row in figures:
         if row.get("reviewState") == "rejected":
@@ -291,6 +366,9 @@ def build(title: str, lines: list[dict], figures: list[dict]) -> WholeDocument:
         else:
             document._order.append(page)
             document._normal[page] = joined
+
+    for page, table_lines in ungridded.items():
+        document._tables[page] = normalise(" ".join(table_lines))
 
     document.text = render(document)
     return document

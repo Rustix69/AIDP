@@ -972,6 +972,14 @@ export function Assessment({
  * a run-on paragraph makes the evidence unreadable at exactly the moment a
  * reviewer is deciding whether a finding is fair. Prose is left alone — its line
  * breaks are where the PDF wrapped and mean nothing.
+ *
+ * Three shapes, because a quote arrives in three. Several lines that each split
+ * on a pipe into the same number of cells is a grid, and gets one. A single
+ * line whose cells carry their own headers is one row of a grid — the commonest
+ * shape by far, since a judge cites the row that decided the clause rather than
+ * the table around it — and it is read down the page as field and value. Here
+ * that is 351 of the 1,140 passages cited across three runs, every one of which
+ * used to render as an unbroken line of text with pipes in it.
  */
 export function Excerpt({ item }: { item: EvidenceItem }) {
   const rows = item.excerpt
@@ -987,6 +995,58 @@ export function Excerpt({ item }: { item: EvidenceItem }) {
     rows.length > 1 && width > 1 && rows.every((row) => row.length === width);
 
   if (!isTable) {
+    // One row of a grid, which is what a quote from a table usually is. It
+    // arrives on a single line with its headers carried inside each cell —
+    // "Data domain: Reference data | System of record / store: ..." — because a
+    // row lifted away from its header line would otherwise be three values and
+    // no way to tell what any of them answers. The grid branch above cannot
+    // help: there is only one line, so there is no header row to split off.
+    //
+    // Read down rather than across. A one-row table printed with its headers
+    // along the top gives three columns one cell deep and wraps badly at any
+    // width; field above value, stacked, is how a reviewer reads a single
+    // record anyway.
+    const cells = rows.length === 1 ? rows[0] : [];
+    const fields = cells.map((cell, i) => {
+      const at = cell.indexOf(":");
+      // A label is short and comes first. Anything longer is a sentence that
+      // happens to contain a colon, and splitting it would invent a field.
+      if (at > 0 && at <= 60 && cell.slice(at + 1).trim()) {
+        return { label: cell.slice(0, at).trim(), value: cell.slice(at + 1).trim() };
+      }
+      // The grid's first column is the row's own name and often arrives with
+      // its header dropped. Unlabelled anywhere else means this is prose.
+      return i === 0 ? { label: "", value: cell } : null;
+    });
+
+    const isRow =
+      cells.length > 1 && fields.every((field) => field !== null && field.value);
+
+    if (isRow) {
+      // The unlabelled leading cell, where there is one, names the row rather
+      // than answering a column — "Analytics", "Order Hub \u2192 Warehouse". It reads
+      // as the record's title, not as a field with a missing name, so it is
+      // printed as one instead of taking a dash where its label would go.
+      const title = fields[0]!.label ? null : fields[0]!.value;
+      const listed = title ? fields.slice(1) : fields;
+      return (
+        <div className="max-w-[68ch] text-[13px] leading-relaxed">
+          {title && <p className="mb-1 font-medium text-ink/84">{title}</p>}
+          <dl className="space-y-1.5">
+            {listed.map((field, i) => (
+              <div
+                key={i}
+                className="grid grid-cols-[minmax(0,10rem)_1fr] gap-x-3 gap-y-0.5 max-sm:grid-cols-1"
+              >
+                <dt className="font-medium text-ink/62">{field!.label}</dt>
+                <dd className="text-ink/82">{field!.value}</dd>
+              </div>
+            ))}
+          </dl>
+        </div>
+      );
+    }
+
     return (
       <p className="max-w-[68ch] text-[13px] leading-relaxed whitespace-pre-wrap text-ink/78">
         {item.excerpt}
