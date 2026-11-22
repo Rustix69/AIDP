@@ -134,6 +134,20 @@ class Config:
     # reference checked by code (see aidp/parsing/rules.py), rather than taken
     # only from the rule-based parser. Off falls back to the parser alone.
     rules_by_model: bool = True
+    #: Let the model's own findings of fact overturn a hedged verdict.
+    #:
+    #: Off by default, because it changes what a verdict means. On, a clause
+    #: graded "partial" whose `contrary_practice` field names a sentence where
+    #: this design does what the clause forbids — and whose quote survives
+    #: verification, and which the document does not record as an approved
+    #: exception — is recorded as "contradicts" instead.
+    #:
+    #: It exists to be measured against the clauses it is aimed at: twenty-one
+    #: breaches that six consecutive runs all graded "partial". Compare the two
+    #: settings on the same clause set with
+    #: `scripts/judge_harness.py --baseline <saved>`.
+    verdict_procedure: bool = False
+
     # Independent readings per standard. The second is the cross-check: lines
     # the two readings disagree about are put in front of a reviewer. One
     # halves the cost and loses that check.
@@ -292,6 +306,7 @@ class Config:
             gemini_thinking_budget=_int("GEMINI_THINKING_BUDGET", 0),
             contextual_preambles=_flag("CONTEXTUAL_PREAMBLES", True),
             rules_by_model=_flag("RULES_BY_MODEL", True),
+            verdict_procedure=_flag("VERDICT_PROCEDURE", False),
             rules_readings=max(1, min(2, _int("RULES_READINGS", 2))),
             judge_readings=max(1, min(5, _int("JUDGE_READINGS", 3))),
             assess_concurrency=max(1, min(32, _int("ASSESS_CONCURRENCY", 8))),

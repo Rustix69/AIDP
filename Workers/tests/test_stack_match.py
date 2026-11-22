@@ -417,13 +417,23 @@ ok(
     "stack_block=stack_block" in second,
     second,
 )
+
+# The primary reading moved into `judged_document_once` when the harness was
+# given the engine's own judging step to measure rather than a copy of it. The
+# invariant is unchanged and is what matters: the block reaches the judge and
+# never reaches the guards, whichever function holds the two calls.
+reading = inspect.getsource(analyse.judged_document_once)
 ok(
     "and the primary reading still is",
-    "_render_clause(clause, stack_block=stack_block)" in source,
+    "_render_clause(clause, stack_block=stack_block)" in reading,
 )
 ok(
     "while the guard copy on the same path still is not",
-    "_render_clause(clause, with_force=False)" in source,
+    "_render_clause(clause, with_force=False)" in reading,
+)
+ok(
+    "and _assess_document_one reaches the judge through that one function",
+    "judged_document_once(" in source,
 )
 
 print(f"\n{passed} passed, {failed} failed")

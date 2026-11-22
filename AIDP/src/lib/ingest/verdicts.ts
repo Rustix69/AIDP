@@ -910,7 +910,7 @@ function splitSentences(rationale: string): string[] {
  * the approval record" is left alone: only "To resolve —" is a label.
  */
 const PART_LABEL =
-  /^(?:gap|impact|fix|missing|why\s+it\s+blocks|to\s+resolve|requirement|evidence|alignment)\s*[-\u2013\u2014:]+\s*/i;
+  /^(?:gap|breach|impact|fix|missing|why\s+it\s+blocks|to\s+resolve|requirement|evidence|alignment)\s*[-\u2013\u2014:]+\s*/i;
 
 /** A sentence with its printed label removed. See `PART_LABEL`. */
 function withoutPartLabel(sentence: string): string {

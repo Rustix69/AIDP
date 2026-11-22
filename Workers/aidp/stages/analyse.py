@@ -262,8 +262,13 @@ MAX_GUARD_REASON = 200
 # the expensive direction to be wrong in.
 _BREACH = re.compile(
     r"\b("
-    r"violat(?:es|ing|ed)"
-    r"|breach(?:es|ing|ed)"
+    # The bare form belongs here with the inflected ones. A plural subject takes
+    # it - "shared vendor accounts violate least-privilege", "these bypasses
+    # breach the clause" - and the rationale is the model's own sentence, not a
+    # style guide, so both conjugations turn up. DAT-019 sat at "partial" with
+    # "violate" in its gap sentence and nothing to promote it.
+    r"violat(?:e|es|ing|ed)"
+    r"|breach(?:|es|ing|ed)"
     r"|conflicts?\s+with"
     r"|directly\s+contradicts?"
     r"|(?:messages?|events?|data|packets?|records?)\s+(?:are|is)\s+"
@@ -1610,6 +1615,114 @@ def _resolve_mode(
     return "document", None, whole
 
 
+def _contrary_practice(verdict: str, rationale: str, raw: dict, whole) -> tuple[str, str]:
+    """Let the model's own finding of fact overturn a hedge. Promote-only.
+
+    The measured failure this answers: on twenty-one clauses that six
+    consecutive runs all got wrong the same way, the model retrieved the
+    sentence in which this design does what the clause forbids, wrote it out
+    correctly in prose, and graded the clause "partial". Asking for the
+    sentence as a field rather than for the label is the difference between an
+    extractive question and a seven-way classification, and the two disagree on
+    exactly the clauses that decide a report.
+
+    Three things have to hold before a verdict moves, and the order is the
+    point:
+
+      1. the model says it found a contrary practice;
+      2. the sentence it quotes is the document's own, word for word, by the
+         same `verify` every piece of evidence goes through — so a breach
+         asserted here and nowhere in the design is refused exactly as an
+         invented evidence quote is;
+      3. the document does not RECORD an exception for it. A carve-out the
+         design merely describes is a breach being narrated; one it records as
+         requested, risk-assessed, time-bound or approved is an exception, and
+         "partial" is then the honest answer.
+
+    Promote-only, and only from "partial". It cannot invent a pass, it cannot
+    reach a clause the model called covered or absent, and `_guard_document`
+    still runs afterwards — so a promoted verdict with no verified evidence
+    behind it is demoted again by the rule that already exists.
+
+    Off unless `VERDICT_PROCEDURE` is set; see `config.verdict_procedure`.
+    """
+    if not get_config().verdict_procedure or verdict != "partial":
+        return verdict, rationale
+
+    practice = raw.get("contrary_practice") or {}
+    if not practice.get("found"):
+        return verdict, rationale
+    quote = " ".join(str(practice.get("quote") or "").split())
+    if not quote or not whole.verify(quote, _page_number(practice.get("page"))).verified:
+        return verdict, rationale
+
+    exception = raw.get("recorded_exception") or {}
+    if exception.get("found"):
+        excused = " ".join(str(exception.get("quote") or "").split())
+        if excused and whole.verify(excused, _page_number(exception.get("page"))).verified:
+            return verdict, rationale
+
+    return _noted(
+        "contradicts",
+        "(Graded 'partial', but the design's own words state the breach: "
+        f"\u201c{_shorten(quote, MAX_BREACH_QUOTE)}\u201d)",
+        rationale,
+    )
+
+
+def judged_document_once(
+    clause: dict,
+    whole,
+    *,
+    reference: str,
+    stack_block: str = "",
+    precedents: list | None = None,
+    reading: int = 0,
+) -> _Judged:
+    """One reading of one clause against the whole document.
+
+    Lifted out of `_assess_document_one` so that it has exactly one
+    implementation. `scripts/judge_harness.py` measures this function, and a
+    harness that measured its own copy of these six steps would drift from the
+    engine silently — which is the one failure a measuring instrument must not
+    have.
+    """
+    offered = precedents or []
+    raw = llm.judge_document(
+        document=whole.text,
+        reference=reference,
+        clause=_render_clause(clause, stack_block=stack_block),
+        precedents=decisions.render(offered),
+        reading=reading,
+    )
+    verdict, confidence, rationale, _, claimed = _normalise(raw, clause)
+    # Before the guards, so a promoted verdict still has to satisfy them.
+    verdict, rationale = _contrary_practice(verdict, rationale, raw, whole)
+    evidence, unverified = _checked_quotes(raw, whole)
+    applied, fabricated = _applied(offered, claimed)
+    verdict, rationale = _guard_document(
+        verdict,
+        confidence,
+        rationale,
+        evidence=evidence,
+        unverified=unverified,
+        fabricated=fabricated,
+        offered=len(offered),
+        conflicted=decisions.conflicting(offered),
+        clause_text=_render_clause(clause, with_force=False),
+    )
+    return _Judged(
+        verdict,
+        confidence,
+        rationale,
+        evidence,
+        applied,
+        0.0,
+        obligation=str(raw.get("obligation") or ""),
+        raw=_raw_answer(raw),
+    )
+
+
 def _assess_document_one(  # noqa: D401 — see _assess_one for the return
     run: dict,
     clause: dict,
@@ -1643,36 +1756,13 @@ def _assess_document_one(  # noqa: D401 — see _assess_one for the return
     precedents = _precedents(run, clause, query, vector, scope)
 
     def once(reading: int) -> _Judged:
-        raw = llm.judge_document(
-            document=whole.text,
+        return judged_document_once(
+            clause,
+            whole,
             reference=reference,
-            clause=_render_clause(clause, stack_block=stack_block),
-            precedents=decisions.render(precedents),
+            stack_block=stack_block,
+            precedents=precedents,
             reading=reading,
-        )
-        verdict, confidence, rationale, _, claimed = _normalise(raw, clause)
-        evidence, unverified = _checked_quotes(raw, whole)
-        applied, fabricated = _applied(precedents, claimed)
-        verdict, rationale = _guard_document(
-            verdict,
-            confidence,
-            rationale,
-            evidence=evidence,
-            unverified=unverified,
-            fabricated=fabricated,
-            offered=len(precedents),
-            conflicted=decisions.conflicting(precedents),
-            clause_text=_render_clause(clause, with_force=False),
-        )
-        return _Judged(
-            verdict,
-            confidence,
-            rationale,
-            evidence,
-            applied,
-            0.0,
-            obligation=str(raw.get("obligation") or ""),
-            raw=_raw_answer(raw),
         )
 
     judged = _read_and_vote(once, get_config().judge_readings, best=0.0, clause=clause)

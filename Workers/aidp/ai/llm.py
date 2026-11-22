@@ -1065,13 +1065,40 @@ Choose exactly one verdict:
                    condition the clause itself states. Never because the document
                    is silent - that is "not_assessable".
 
+Before the verdict, two findings of fact. Answer both from the document, and answer \
+them whatever verdict you go on to reach.
+
+contrary_practice - is there a passage in which THIS DESIGN does the thing the clause \
+forbids, or declines as a stated choice something it requires? If there is, set found \
+to true and quote that sentence word for word with its page. The sentences you are \
+looking for read like the design describing itself: "session recording is not enabled \
+for this path", "the staging file remains unencrypted on an EC2 volume", "two vendor \
+support accounts are shared", "the legacy repository is excluded from the standard \
+pipeline". A "not" or a "no" inside such a sentence does not make it silence - the \
+design has told you what it does. Where the document is merely quiet about the \
+clause's subject, found is false and quote is empty: silence is not a contrary \
+practice, and guessing one here is the one error this field cannot absorb.
+
+recorded_exception - if you found a contrary practice, does the document RECORD that \
+carve-out as requested, risk-assessed, time-bound or approved? Quote the record. A \
+carve-out the document merely describes - "legacy", "temporary", "manual for now", \
+"pending migration", "agreed by the team", "safe because the network is private" - is \
+a breach being narrated, not an exception being granted, and found is false.
+
+Both quotes are checked against the document word for word exactly as evidence is, so \
+a sentence that is not in the document is refused and the field is read as empty.
+
 Rules that matter more than being decisive:
 
 1. Evidence is quotations copied exactly, character for character, from the document \
 text above, each with the page it is on. Never paraphrase, never join words from two \
 places into one quote, and never quote a figure description or these instructions. \
-Every quote is checked against the document, and a quote that is not there word for \
-word throws the verdict out.
+The technology stack block, where one is given, is also not the design: it is this \
+organisation's own record of approved technology, supplied so you can tell an \
+approved choice from an unapproved one. Never quote it. Quote the design's own \
+sentence naming the technology instead, and say what the stack records about it in \
+your rationale. Every quote is checked against the document, and a quote that is not \
+there word for word throws the verdict out.
 2. "covered", "partial" and "contradicts" MUST give at least one quote: the passage \
 that decides it, a full sentence or table row where there is one.
 3. "covered" means every requirement of the clause is met, so give a quote for each \
@@ -1101,9 +1128,15 @@ username/password authentication." "Catalog service is the system of record. \
 Merchandising also maintains a spreadsheet that may supersede service values." Both of \
 those say the design complies and then name where it does not. Following a rule \
 everywhere except one named system does not meet a clause that says must: that is \
-"partial" where the clause allows a documented exception, and "contradicts" where it \
-allows none. Quote the exception as well as the rule. You have the whole document, so \
-this is a check you can actually perform: having found the passage that answers the \
+"contradicts", by rule 6, and the share of the estate that complies does not soften \
+it. "Most services do" is the sentence a reviewer most needs refused: a clause that \
+says must is breached by the one place that does not. "Partial" is open to you here \
+only where the clause itself provides for an exception AND you can quote the document \
+recording that exception as requested, risk-assessed, time-bound or approved. A \
+carve-out the document merely describes - legacy, temporary, manual for now, pending \
+migration, agreed by a team, safe because the network is private - is a breach being \
+narrated, not an exception being granted. Quote the exception as well as the rule. \
+You have the whole document, so this is a check you can actually perform: having found the passage that answers the \
 clause, read the rest of its sentence, its row and its section before you grade it. If \
 the passage you were about to offer as proof of compliance also contains a "but", an \
 "except", a "legacy", a "manual", a "not enabled" or any named carve-out, that half is \
@@ -1138,6 +1171,16 @@ term does not appear. Where you find the function under another name, quote that
 passage and judge the clause on what the design does, saying in the rationale which \
 term the design uses. If your rationale would say the design "does not mention" or \
 "lacks" something, satisfy yourself first that it does not provide it by another name.
+5ab. Having satisfied yourself of that, do not then settle for "partial". Before you \
+answer "partial", quote the passage that engages THIS clause's own mechanism. If the \
+only passages you can offer are about a neighbouring subject - data classification \
+quoted for a clause on detecting exfiltration, a logical data architecture quoted for \
+a clause on conceptual and logical modelling, bucket encryption quoted for a clause \
+on PII scanning and fine-grained access - then the document has not engaged this \
+clause at all, and the verdict is "absent". "The design describes X but does not \
+describe Y" is "absent" whenever Y is what the clause is about and X is merely near \
+it. "Partial" is for a document that answers part of this clause and leaves the rest \
+unmet; it is not the safe middle answer when you have found nothing that answers it.
 5a. A document that does not say is not a document that breaches, and this rule \
 outranks being decisive. Where the clause turns on a record a design would not \
 normally carry - an approval, a waiver, a signed exception, a governance decision, \
@@ -1203,6 +1246,20 @@ a retention period, routing around an approved gateway, disabling or skipping a 
 required check — each states an action the clause forbids, however the design \
 justifies it. Silent omission of a secondary detail is "partial"; choosing not to do \
 what the clause requires is not silence.
+6b. Apply 6 and 6a to the document's sentence, not to your own. Before grading, find \
+the design's own words on this clause and read what they say it DOES. "Session \
+recording is not enabled for this path." "The staging file remains unencrypted on an \
+EC2 volume." "Two vendor support accounts are shared." "Two legacy integrations read \
+credentials from local environment files." Each states a practice this design has \
+adopted, and a practice the clause forbids is "contradicts". A "not" or a "no" inside \
+such a sentence does not turn it into silence: the design has told you what it does, \
+and what it does is the thing the clause prohibits. "Partial" and "absent" belong to \
+what the document does NOT say. So do not restate a practice as a shortfall and then \
+grade the restatement - "lacks session recording", "missing encryption", "no audit \
+trail", "not consistently applied" are your words, not the design's, and grading them \
+instead of the sentence is how a breach the design states plainly becomes a gap \
+nobody is accountable for. If you can quote a sentence in which this design does the \
+forbidden thing, the verdict is "contradicts" however the rest of the estate behaves.
 7. Judge only what the clause requires. Do not reward the design for good practice the \
 clause does not ask for.
 8. Standing decisions, where any are given, are this organisation's own settled \
@@ -1217,13 +1274,26 @@ requirement left unmet. Start with the substance. No throat-clearing: never open
 order, as three complete sentences in plain English, up to 600 characters in all — \
 about 200 a sentence, which is room to name the component, the page and the \
 mechanism without abbreviating: \
-GAP — what the design does or fails to do, in its own terms. \
+GAP — what the design does or fails to do, in its own terms. For "contradicts" this \
+part is not a gap at all, whatever the label says: name the practice the design has \
+adopted and the clause forbids, in the design's own words, as the thing it does. The \
+design has not left a hole here, it has made a choice, and writing that choice up as \
+something the design "lacks" or is "missing" is the restatement rule 6b refuses. \
 IMPACT — the consequence if it ships as it stands: the outage, breach, data loss, \
 audit failure or cost. One clause of plain consequence, never a restatement of the \
 gap and never "it is non-compliant", which tells a reader nothing the verdict has not \
 already said. \
 FIX — the mechanism, setting or control that would satisfy the clause, named \
 concretely, never "address the requirement". \
+Three sentences, not four and not two. The fourth one you are inclined to write is \
+always the same, and it goes between the gap and the impact: "This is a gap because \
+...", "This omission leaves the clause unaddressed.", "This breaches the requirement \
+that ...". Do not write it. It restates the gap and names the verdict, which the \
+reader already has, and it costs them the labelled report: GAP, IMPACT and FIX are \
+printed only where exactly three sentences are found, so a fourth sentence turns all \
+three labels off and the finding renders as an unbroken paragraph. Two is no better - \
+a rationale that stops after the gap, or after the gap and the impact, leaves the \
+reviewer with nothing to do. \
 Write each one as a senior architect writes in a review document, in full sentences \
 with ordinary grammar. Never compress: no dropped articles, no telegraphic \
 fragments, no noun stacks standing in for a clause. "Retain GCP only with a \
@@ -1295,6 +1365,55 @@ _DOCUMENT_VERDICT_SCHEMA = {
         # only worth anything if they happen before the answer is committed to.
         # Never read back; `_normalise` takes the fields it needs by name.
         "internal_architect_reasoning": {"type": "string"},
+        # The two findings of fact the verdict turns on, asked for by name and
+        # placed BEFORE the verdict so they are generated before the label is
+        # committed to.
+        #
+        # They exist because of a measured failure. On SEC-006, SEC-008,
+        # SEC-014, SEC-019, DAT-020 and SOL-012 the model retrieved the exact
+        # sentence in which this design does the thing the clause forbids,
+        # described it correctly in prose, and then graded the clause
+        # "partial" — twenty-one clauses are wrong that same way in every one
+        # of six measured runs. Four successive rules aimed at the
+        # partial/contradicts boundary moved that error from 37 clauses to 28
+        # and no further, which is what a prompt carrying policy looks like
+        # when it runs out.
+        #
+        # So the model is asked for the sentence rather than for the label.
+        # "Is there a passage where the design does what this clause forbids,
+        # and what is it word for word" is extractive; "which of seven labels
+        # applies" is not, and the two disagree on exactly the clauses that
+        # matter.
+        #
+        # `found` carries the answer and `quote` has to survive
+        # `whole_document.verify` like any other, so a breach asserted here and
+        # nowhere in the document is refused the same way an invented evidence
+        # quote is.
+        "contrary_practice": {
+            "type": "object",
+            "properties": {
+                "found": {"type": "boolean"},
+                "quote": {"type": "string"},
+                "page": {"type": "integer", "nullable": True},
+            },
+            "required": ["found", "quote", "page"],
+            "propertyOrdering": ["found", "quote", "page"],
+        },
+        # And the other half of the same question, because a design is allowed
+        # to breach a clause that provides for it. The distinction is whether
+        # the document RECORDS the exception — requested, risk-assessed,
+        # time-bound, approved — or merely describes the carve-out, which is a
+        # breach being narrated rather than an exception being granted.
+        "recorded_exception": {
+            "type": "object",
+            "properties": {
+                "found": {"type": "boolean"},
+                "quote": {"type": "string"},
+                "page": {"type": "integer", "nullable": True},
+            },
+            "required": ["found", "quote", "page"],
+            "propertyOrdering": ["found", "quote", "page"],
+        },
         # All seven, as in _VERDICT_SCHEMA. The two at the end were missing
         # here while the prompt above spent rules 5a, 5a-i, 5a-ii, 5b, 5c and
         # 5d teaching the model when to use them — and a strict schema wins
@@ -1345,6 +1464,8 @@ _DOCUMENT_VERDICT_SCHEMA = {
     },
     "required": [
         "internal_architect_reasoning",
+        "contrary_practice",
+        "recorded_exception",
         "verdict",
         "confidence",
         "rationale",
@@ -1354,6 +1475,8 @@ _DOCUMENT_VERDICT_SCHEMA = {
     ],
     "propertyOrdering": [
         "internal_architect_reasoning",
+        "contrary_practice",
+        "recorded_exception",
         "verdict",
         "confidence",
         "rationale",

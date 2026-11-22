@@ -96,6 +96,11 @@ services:
       # constant to compare two judges against the answer key at all.
       # Defaults to the .env model, so leaving it alone changes nothing.
       OPENROUTER_MODEL: ${JUDGE_MODEL:-openai/gpt-4.1-mini}
+      # Let the model's own findings of fact overturn a hedged verdict, rather
+      # than taking the label it chose. Off here and off in config.py: it
+      # changes what a verdict means, so it is turned on deliberately and
+      # measured before it ships. See `scripts/judge_harness.py --procedure`.
+      VERDICT_PROCEDURE: ${VERDICT_PROCEDURE:-off}
       JUDGE_READINGS: ${JUDGE_READINGS:-}
       ASSESS_CONCURRENCY: ${ASSESS_CONCURRENCY:-}
       PREFER_WHOLE_DOCUMENT: ${PREFER_WHOLE_DOCUMENT:-off}
