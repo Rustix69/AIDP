@@ -1100,6 +1100,12 @@ class _Judged:
     # where there is no model answer to keep and `_write` falls back to the
     # finding's own.
     raw: tuple[str, float, str] | None = None
+    # What a reading would have been had the opening words of its quote counted:
+    # (verdict, rationale, evidence), set only when `_guard_document` demoted it
+    # for a quote that did not verify whole while the first words of that quote
+    # do sit in the document. A reading never uses this on its own; `_rescue`
+    # does, and only when most readings agree. See there.
+    held: tuple[str, str, list[dict]] | None = None
 
 
 # What a dissenting reading's rationale is cut to. It is context beside the
@@ -1139,6 +1145,92 @@ def _settled(taken: list[_Judged], readings: int) -> bool:
     return leader > runner_up + remaining
 
 
+# The fewest words of a quote that may stand in for the whole of it. Shorter
+# than this is a phrase that could sit anywhere in a design.
+MIN_PREFIX_WORDS = 8
+
+# Verdicts a partly verified quote may carry. `not_applicable` and
+# `not_assessable` are held to the strictest proof and are never rescued.
+_RESCUABLE = ("covered", "partial", "contradicts")
+
+
+def _prefix_evidence(unverified: list[tuple[str, str]], whole) -> list[dict]:
+    """Evidence from the longest opening stretch of each refused quote that is
+    the document's own words.
+
+    A model copying a table row tends to start on a real row and then splice
+    cells or lose a separator, so the quote as a whole is not a subsequence of
+    the page while its first words plainly are. Only the words that were found
+    are kept as the excerpt, never the model's full quote, so the finding does
+    not claim a sentence the document does not contain.
+    """
+    out: list[dict] = []
+    for quote, _reason in unverified[:MAX_QUOTES]:
+        words = quote.split()
+        if len(words) <= MIN_PREFIX_WORDS:
+            continue
+        for size in range(len(words) - 1, MIN_PREFIX_WORDS - 1, -1):
+            head = " ".join(words[:size])
+            check = whole.verify(head, None)
+            if check.verified and check.source_kind != "figure":
+                out.append(
+                    {
+                        "chunkId": f"quote-{len(out) + 1}",
+                        "headingPath": "",
+                        "page": check.page,
+                        "excerpt": head[:1500],
+                        "sourceKind": "quote",
+                        "figureId": None,
+                        "claimedPage": None,
+                        "partial": True,
+                    }
+                )
+                break
+    return out
+
+
+def _rescue(taken: list[_Judged]) -> list[_Judged]:
+    """Give back a verdict the quote guard took from readings that agreed.
+
+    `_guard_document` demotes a reading whose quote does not verify, and it
+    cannot tell an invented quote from a real row copied badly. On the Meridian
+    run that cost INT-002 and three other clauses the key marks covered: every
+    reading said covered and every quote opened on a real row.
+
+    A wrong "covered" is the expensive error, so the standard is not lowered for
+    one reading. It is lowered only where at least two readings independently
+    reached the same verdict, each with a quote whose opening words are the
+    document's own, and where that verdict leads every other final answer. The
+    readings concerned are given the verdict and the located words as their
+    evidence, and the rationale says plainly that the quote was only partly
+    verified. A lone reading, a split, or a reading whose opening words are not
+    in the document is left demoted, exactly as before.
+    """
+    held = Counter(judged.held[0] for judged in taken if judged.held)
+    if not held:
+        return taken
+    verdict, count = held.most_common(1)[0]
+    if count < 2:
+        return taken
+    others = Counter(judged.verdict for judged in taken if not judged.held)
+    if others and max(others.values()) >= count:
+        return taken
+    note = (
+        "(The quote was only partly verified: its opening words are in the document, "
+        f"the rest could not be matched. {count} of {len(taken)} readings reached this verdict.)"
+    )
+    rescued: list[_Judged] = []
+    for judged in taken:
+        if judged.held and judged.held[0] == verdict:
+            _, rationale = _noted(verdict, note, judged.held[1])
+            rescued.append(
+                replace(judged, verdict=verdict, rationale=rationale, evidence=judged.held[2], held=None)
+            )
+        else:
+            rescued.append(judged)
+    return rescued
+
+
 def _vote(taken: list[_Judged]) -> _Judged:
     """One verdict out of several readings of one clause: what most of them said.
 
@@ -1163,6 +1255,7 @@ def _vote(taken: list[_Judged]) -> _Judged:
     if len(taken) == 1:
         return taken[0]
 
+    taken = _rescue(taken)
     ranked = Counter(judged.verdict for judged in taken).most_common()
     leader, votes = ranked[0]
     split = len(ranked) > 1 and ranked[1][1] == votes
@@ -1700,6 +1793,12 @@ def judged_document_once(
     verdict, rationale = _contrary_practice(verdict, rationale, raw, whole)
     evidence, unverified = _checked_quotes(raw, whole)
     applied, fabricated = _applied(offered, claimed)
+    asked = (verdict, rationale)
+    guard_args = dict(
+        offered=len(offered),
+        conflicted=decisions.conflicting(offered),
+        clause_text=_render_clause(clause, with_force=False),
+    )
     verdict, rationale = _guard_document(
         verdict,
         confidence,
@@ -1707,10 +1806,26 @@ def judged_document_once(
         evidence=evidence,
         unverified=unverified,
         fabricated=fabricated,
-        offered=len(offered),
-        conflicted=decisions.conflicting(offered),
-        clause_text=_render_clause(clause, with_force=False),
+        **guard_args,
     )
+    held = None
+    if asked[0] in _RESCUABLE and verdict == "needs_review" and not evidence and unverified:
+        # The quote guard is what demoted this reading. Work out what the
+        # reading would have been had the opening words of its quote counted,
+        # running every other guard over it, and hold that for `_rescue`.
+        partial = _prefix_evidence(unverified, whole)
+        if partial:
+            again, again_rationale = _guard_document(
+                asked[0],
+                confidence,
+                asked[1],
+                evidence=partial,
+                unverified=[],
+                fabricated=fabricated,
+                **guard_args,
+            )
+            if again == asked[0]:
+                held = (again, again_rationale, partial)
     return _Judged(
         verdict,
         confidence,
@@ -1720,6 +1835,7 @@ def judged_document_once(
         0.0,
         obligation=str(raw.get("obligation") or ""),
         raw=_raw_answer(raw),
+        held=held,
     )
 
 
