@@ -1062,8 +1062,9 @@ Choose exactly one verdict:
 - "needs_review" - you cannot tell: the document touches the subject but is
                    ambiguous, or the only support is a figure description
 - "not_applicable" - the clause does not govern the architecture described, on a
-                   condition the clause itself states. Never because the document
-                   is silent - that is "not_assessable".
+                   condition the clause itself states (rule 5b). Never because the
+                   document is silent on what the clause requires - that is
+                   "absent" or "not_assessable".
 
 Before the verdict, two findings of fact. Answer both from the document, and answer \
 them whatever verdict you go on to reach.
@@ -1213,6 +1214,18 @@ would hold it. Rule 5a governs that case and that case only.
 silence. Quote the passage establishing what this architecture is, and name the \
 stated condition of the clause that excludes it. Where the clause states no such \
 condition, you may not answer "not_applicable".
+5b-i. A clause whose subject is one particular kind of workload or component states \
+its own condition: "GPU capacity for training and self-hosted inference is \
+provisioned ...", "Production generative AI applications should ...". It governs a \
+design only if the design has that kind of workload or component. You have the whole \
+document, so you can tell: where the design describes what it runs and nothing it \
+runs is of that kind, the answer is "not_applicable" - not "absent", and there is no \
+gap to report. Quote the passage that says what the design runs (its compute, its \
+applications, its scope) and name the kind the clause is about. This is NOT for a \
+clause that tells designs in general what to build on or how to work - "services \
+shall log to ...", "solutions shall use the approved ..." - which governs every \
+design it names; that clause is never "not_applicable", and the other rules decide \
+its verdict exactly as before.
 5c. Never state a rule the clause does not. Before answering "contradicts", read \
 the clause's own force: one that says an option "shall be assessed as the primary \
 preference", or that provides for "other platforms" under stated conditions, is a \
