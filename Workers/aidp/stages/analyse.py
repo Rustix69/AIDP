@@ -21,6 +21,7 @@ gap into production.
 
 from __future__ import annotations
 
+import hashlib
 import contextvars
 import re
 from collections import Counter
@@ -358,7 +359,37 @@ def _stack_block(conn, rows: stack.Stack, scope: designs.Scope) -> str:
     text = stack.design_text(conn, scope.document_ids)
     if not text:
         return ""
-    return stack.render(rows, stack.names_in(rows, text))
+    hits = stack.names_in(rows, text)
+    return stack.render(rows, hits, _unmatched(rows, text))
+
+
+# Names a design uses, by the design's own text, so a run that is assessed again
+# (or a second design with the same text) does not pay for the extraction twice.
+_NAMED: dict[str, list[str]] = {}
+
+
+def _unmatched(rows: stack.Stack, text: str) -> list[stack.Hit]:
+    """Technologies the design names that the stack has no entry for.
+
+    One small model call per design, remembered for as long as the worker lives,
+    then checked entirely in code (see `stack.unlisted`). Off unless
+    `STACK_UNLISTED` is set, because it changes what the judge is told and so
+    belongs behind a measurement. Any failure leaves the block as it was.
+    """
+    if not get_config().stack_unlisted:
+        return []
+    key = hashlib.sha1(text.encode("utf-8", "ignore")).hexdigest()
+    if key not in _NAMED:
+        try:
+            answer = llm.find_named_technologies(design=text)
+            names = answer.get("names") if isinstance(answer, dict) else None
+            _NAMED[key] = [str(name) for name in names or []]
+        except llm.QuotaExhausted:
+            raise
+        except Exception as exc:  # noqa: BLE001 — a missing extra fact must not fail a run
+            logs.warn(log, "technology names could not be read", error=str(exc)[:200])
+            return []
+    return stack.unlisted(rows, text, _NAMED[key])
 
 
 def _context(conn, scope: designs.Scope) -> str:
