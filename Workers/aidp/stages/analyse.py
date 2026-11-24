@@ -1220,6 +1220,155 @@ def _prefix_evidence(unverified: list[tuple[str, str]], whole) -> list[dict]:
     return out
 
 
+# One entry of the stack block `stack.render` prints beside a technology clause:
+# the stack's record of a technology, then the design's own words naming it.
+_STACK_ENTRY = re.compile(r"^- (?P<head>[^\n]+)\n  Design says: (?P<says>[^\n]+)$", re.M)
+# The opening of the block that lists those entries.
+_STACK_LIST = "Technologies this design names"
+# Letters and digits a quote must share with a snippet's text to be taken as a
+# copy of it: about eight words, so a common phrase cannot claim an entry.
+MIN_SNIPPET_MATCH = 40
+
+
+def _flat(text: str) -> str:
+    """Letters and digits only: a stack line survives a mangled dash this way."""
+    return re.sub(r"[^a-z0-9]", "", text.lower())
+
+
+def _unclipped(snippet: str) -> str:
+    """A `stack._around` snippet without the part-words its cut left at each end."""
+    words = snippet.split()
+    if snippet.startswith("…") and len(words) > 1:
+        words = words[1:]
+    if snippet.endswith("…") and len(words) > 1:
+        words = words[:-1]
+    return " ".join(words).strip("…").strip()
+
+
+# Where `stack.design_text` joins what the document prints apart: table cells
+# ("column 3:"), a heading trail ("›"), a figure's bullets ("•"), cell ends
+# (".."), and a row's label from its value (" — " where the page prints "|").
+_SNIPPET_SEAMS = re.compile(r"\s*(?:\.\.+|column \d+:|›|•|\|)\s*|\s+—\s+|(?<=[.!?])\s+")
+
+
+def _design_words(says: str, name: str, whole):
+    """The stretch of a stack snippet that is in the document, as (text, check).
+
+    The snippet comes from the stack module's flattened copy of the design, in
+    which a table row reads "column 2: … column 3: S3, Glue, Redshift" and runs
+    on across a heading. Whole, that is often not the document's wording. Each
+    piece between those seams may be, and the longest one that still names the
+    technology is taken: a piece that does not name it is no evidence of it.
+    Nothing that fails `verify` is ever returned.
+    """
+    text = _unclipped(says.strip())
+    if not text:
+        return None
+    check = whole.verify(text, None)
+    if check.verified:
+        return text, check
+    # Named the way the stack module found it in the first place, so
+    # "Amazon Redshift" is named by a piece that says "Redshift".
+    patterns = [found for found, _ in stack._searchable(stack.Row(name, ""))] if name else []
+    pieces = [p.strip(" .,;:—") for p in _SNIPPET_SEAMS.split(text)]
+    pieces = [
+        p
+        for p in pieces
+        if len(p.split()) >= whole_document.MIN_QUOTE_WORDS
+        and (not name or any(found.search(p) for found in patterns))
+    ]
+    for piece in sorted(pieces, key=len, reverse=True):
+        check = whole.verify(piece, None)
+        if check.verified:
+            return piece, check
+    return None
+
+
+def _copied(quote: str, named: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """The entries whose "Design says" snippet this quote is a copy of.
+
+    Matched on the quote's opening, cell labels dropped, so a copy that starts
+    where the snippet does is found whatever the punctuation became. Each keeps
+    its technology's name, so what stands in for the copy must still name it.
+    """
+    unlabelled = lambda text: _flat(re.sub(r"column \d+:", "", text))  # noqa: E731
+    opening = unlabelled(_unclipped(quote.strip()))[:MIN_SNIPPET_MATCH]
+    if len(opening) < MIN_SNIPPET_MATCH:
+        return []
+    return [(name, says) for name, says in named if opening in unlabelled(says)]
+
+
+def _stack_quotes(
+    unverified: list[tuple[str, str]], stack_block: str, whole
+) -> tuple[list[dict], list[tuple[str, str]]]:
+    """Answer a quote of the stack record with the design's words it was built from.
+
+    A judge reading a technology clause has the organisation's stack printed
+    under it, and it often quotes that — "Amazon Redshift — recorded as Hold,
+    approved versions: RA3 / Serverless" — as its evidence. Those words are ours,
+    not the design's, so the quote guard refuses them. On Meridian that sent
+    readings of EA-007 (Redshift and Oracle on Hold) and EA-008 (Mirth Connect
+    not in the stack), both breaches the readings had found, to needs_review.
+
+    Every entry in the block carries the design's own words naming the
+    technology ("Design says: …"). Those words are what the stack line stands
+    for, so they are the evidence: checked against the document like any quote,
+    and kept only if found there. A quote is taken as a stack line when it
+    names an entry and its recorded position, when it is the list's heading
+    (which stands for every entry), or when it copies an entry's snippet. The
+    record itself is never evidence, and any other quote is left as refused.
+    """
+    if not stack_block or not unverified:
+        return [], unverified
+    entries = [(m["head"], m["says"]) for m in _STACK_ENTRY.finditer(stack_block)]
+    if not entries:
+        return [], unverified
+
+    found: list[dict] = []
+    seen: set[str] = set()
+    remaining: list[tuple[str, str]] = []
+    for quote, reason in unverified:
+        flat = _flat(quote)
+        named = [(head.split(" — ")[0], says) for head, says in entries]
+        if "design says:" in quote.lower():
+            # A snippet quoted with its label: the snippet is what it stands for.
+            sayings = _copied(quote[quote.lower().rindex("design says:") + len("design says:") :], named)
+        elif _flat(_STACK_LIST) in flat:
+            sayings = named
+        else:
+            sayings = [
+                (name, says)
+                for (name, says), (head, _) in zip(named, entries)
+                if _flat(name) and _flat(name) in flat and ("recordedas" in flat or flat in _flat(head))
+            ] or _copied(quote, named)
+        kept = 0
+        for name, says in sayings:
+            if len(found) >= MAX_QUOTES:
+                break
+            located = _design_words(says, name, whole)
+            if not located or located[0] in seen:
+                continue
+            text, check = located
+            seen.add(text)
+            kept += 1
+            found.append(
+                {
+                    "chunkId": f"stack-{len(found) + 1}",
+                    "headingPath": "",
+                    "page": check.page,
+                    "excerpt": text[:1500],
+                    # As `_checked_quotes` labels them: words found only in a
+                    # diagram description go to the guards as a figure.
+                    "sourceKind": check.source_kind if check.source_kind == "figure" else "quote",
+                    "figureId": check.figure_id,
+                    "claimedPage": None,
+                }
+            )
+        if not kept:
+            remaining.append((quote, reason))
+    return found, remaining
+
+
 def _rescue(taken: list[_Judged]) -> list[_Judged]:
     """Give back a verdict the quote guard took from readings that agreed.
 
@@ -1823,6 +1972,10 @@ def judged_document_once(
     # Before the guards, so a promoted verdict still has to satisfy them.
     verdict, rationale = _contrary_practice(verdict, rationale, raw, whole)
     evidence, unverified = _checked_quotes(raw, whole)
+    stacked, unverified = _stack_quotes(unverified, stack_block, whole)
+    have = {item["excerpt"] for item in evidence}
+    evidence = evidence + [item for item in stacked if item["excerpt"] not in have]
+    evidence = evidence[:MAX_QUOTES]
     applied, fabricated = _applied(offered, claimed)
     asked = (verdict, rationale)
     guard_args = dict(
